@@ -94,6 +94,11 @@ def _reap_zombies() -> None:
 
 def find_codex_bin(custom_path: str | None = None) -> str | None:
     """Find the codex CLI executable in PATH or standard install locations."""
+    managed = Path.home() / ".antigravity/bridge/codex-npm"
+    managed_bin = managed / "bin/codex"
+    if (not custom_path or custom_path == "/usr/local/bin/codex") and (managed / ".bridge-active").is_file():
+        if managed_bin.is_file() and os.access(managed_bin, os.X_OK):
+            return str(managed_bin)
     if custom_path:
         try:
             if os.path.isfile(custom_path) and os.access(custom_path, os.X_OK):
@@ -266,11 +271,19 @@ async def update_npm_codex() -> tuple[bool, str]:
             return False, f"Codex CLI уже актуален: {installed_match.group(0)}"
         rc, output = await _codex_update_command(npm, "install", "-g", "--prefix", prefix, "@openai/codex@latest")
         if rc:
-            return False, f"Обновление Codex CLI не удалось: {output[-300:]}"
+            if not re.search(r"EACCES|EPERM|permission denied", output, re.IGNORECASE):
+                return False, f"Обновление Codex CLI не удалось: {output[-300:]}"
+            managed = Path.home() / ".antigravity/bridge/codex-npm"
+            rc, output = await _codex_update_command(npm, "install", "-g", "--prefix", str(managed), "@openai/codex@latest")
+            if rc:
+                return False, f"Установка Codex CLI в домашний каталог не удалась: {output[-300:]}"
+            binary = str(managed / "bin/codex")
         rc, updated = await _codex_update_command(binary, "--version", timeout=10)
         match = re.search(r"\b(\d+)\.(\d+)\.(\d+)\b", updated)
         if rc or not match or tuple(map(int, match.groups())) < tuple(map(int, latest_match.groups())):
             return False, "npm завершился, но используемый мостом Codex CLI не обновился"
+        if binary == str(Path.home() / ".antigravity/bridge/codex-npm/bin/codex"):
+            (Path(binary).parent.parent / ".bridge-active").touch()
         from src import models
         models._cached_codex_models = None
         models._cached_codex_at = 0.0

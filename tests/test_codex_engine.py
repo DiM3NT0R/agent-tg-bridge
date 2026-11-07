@@ -321,6 +321,39 @@ async def test_update_npm_codex_does_not_replace_unmanaged_install(tmp_path, mon
 
 
 @pytest.mark.asyncio
+async def test_update_npm_codex_uses_private_install_after_permission_denied(tmp_path, monkeypatch):
+    from src import codex_runner
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(codex_runner, "find_codex_bin", lambda *_: "/usr/local/bin/codex")
+    monkeypatch.setattr(codex_runner, "_npm_codex_prefix", lambda *_: "/usr/local")
+    monkeypatch.setattr(codex_runner.shutil, "which", lambda *_: "/usr/bin/npm")
+    managed = tmp_path / ".antigravity/bridge/codex-npm"
+    (managed / "bin").mkdir(parents=True)
+    command = AsyncMock(side_effect=[(0, "codex-cli 0.147.0"), (0, "0.166.0"), (1, "npm ERR! EACCES"), (0, "installed"), (0, "codex-cli 0.166.0")])
+    monkeypatch.setattr(codex_runner, "_codex_update_command", command)
+    ok, _ = await codex_runner.update_npm_codex()
+    assert ok
+    assert command.await_args_list[3].args == ("/usr/bin/npm", "install", "-g", "--prefix", str(managed), "@openai/codex@latest")
+    assert command.await_args_list[4].args == (str(managed / "bin/codex"), "--version")
+    assert (managed / ".bridge-active").exists()
+
+
+def test_find_codex_prefers_activated_private_install(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    managed = tmp_path / ".antigravity/bridge/codex-npm"
+    (managed / "bin").mkdir(parents=True)
+    binary = managed / "bin/codex"
+    binary.write_text("#!/bin/sh\n")
+    binary.chmod(0o755)
+    (managed / ".bridge-active").touch()
+    assert find_codex_bin("/usr/local/bin/codex") == str(binary)
+    custom = tmp_path / "custom"
+    custom.write_text("#!/bin/sh\n")
+    custom.chmod(0o755)
+    assert find_codex_bin(str(custom)) == str(custom)
+
+
+@pytest.mark.asyncio
 async def test_codex_updates_wait_for_turns_and_block_new_turns():
     from src.codex_runner import codex_turn_guard, codex_update_guard
     entered = asyncio.Event()
