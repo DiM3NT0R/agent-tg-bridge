@@ -256,7 +256,7 @@ def build_handoff_digest(
     """Build a compact (~400-600 tokens) cross-engine handoff memorandum."""
     lines = [
         f"[Контекст: переключение движка с {from_engine.upper()} на {to_engine.upper()}]",
-        "Для оптимизации токенов сырая история очищена. Ключевое состояние проекта:",
+        "Краткая выдержка из предыдущего диалога; она может быть неполной:",
     ]
 
     # 1. Summary from previous engine
@@ -282,8 +282,8 @@ def build_handoff_digest(
     if recent_turns:
         lines.append("• Недавние сообщения в диалоге (из предыдущего движка):")
         for rt in recent_turns:
-            u_snip = str(rt.get("user") or "").strip().replace("\n", " ")[:400]
-            a_snip = str(rt.get("assistant") or "").strip().replace("\n", " ")[:600]
+            u_snip = str(rt.get("user") or "").strip()[:4000]
+            a_snip = str(rt.get("assistant") or "").strip()[:6000]
             lines.append(f"  - Пользователь: {u_snip}")
             lines.append(f"  - Ассистент: {a_snip}")
 

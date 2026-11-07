@@ -123,6 +123,31 @@ def test_context_compactor_handoff():
     assert "Continue after agy" in switched_again
 
 
+def test_handoff_preserves_details_beyond_first_600_characters(tmp_path):
+    from src.context_compactor import append_chat_history
+
+    reply = "Описание проблемы. " * 50 + "Третья причина: важная деталь."
+    append_chat_history(str(tmp_path), "Что исправили?", reply, engine="agy")
+    digest = build_handoff_digest(str(tmp_path), "agy", "codex")
+    assert "Третья причина: важная деталь." in digest
+
+
+@pytest.mark.asyncio
+async def test_failed_switch_retries_handoff(tmp_path, monkeypatch):
+    from src.turn import execute_turn
+
+    cs = ChatState(chat_dir=str(tmp_path), engine="codex", last_turn_engine="agy", model="gpt-6.1-sol")
+    runner = AsyncMock(side_effect=[("Ошибка", 1), ("Готово", 0)])
+    monkeypatch.setattr("src.turn.execute_codex", runner)
+    cfg = MagicMock()
+    await execute_turn(None, 1, "Продолжай", None, cs, cfg)
+    assert cs.last_turn_engine == "agy"
+    await execute_turn(None, 1, "Повтори", None, cs, cfg)
+    assert cs.last_turn_engine == "codex"
+    for call in runner.await_args_list:
+        assert "переключение движка с AGY на CODEX" in call.args[2]
+
+
 def test_split_thoughts_and_final():
     # Multiple messages: intermediate thoughts + final answer
     chunks = [

@@ -650,7 +650,6 @@ async def execute_turn(
     # Apply token handoff if switching engines
     prompt_for_engine = prepare_turn_prompt(prompt, cs, target_engine)
     cs.engine = target_engine
-    cs.last_turn_engine = "openai" if target_engine == "openai_compat" else target_engine
 
     if target_engine in ("openai", "openai_compat"):
         reply_text, exit_code = await execute_openai_compat(tg, chat_id, prompt_for_engine, msg, cs, cfg)
@@ -660,6 +659,7 @@ async def execute_turn(
         reply_text, exit_code = await _execute_agy_internal(tg, chat_id, prompt_for_engine, msg, cs, cfg, agy_path)
 
     if exit_code == 0 and reply_text:
+        cs.last_turn_engine = "openai" if target_engine == "openai_compat" else target_engine
         append_chat_history(
             chat_dir=cs.chat_dir,
             user_prompt=prompt,
