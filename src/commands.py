@@ -1765,6 +1765,7 @@ async def handle_text_command(
         cs.has_session = False
         cs.conversation_id = ""
         cs.codex_thread_id = ""
+        cs.last_turn_engine = ""
         clear_chat_history(cs.chat_dir)
         return BridgeReply("🧹 Сессия сброшена для всех движков (AGY, Codex, API). Следующее сообщение начнет чистую сессию.")
     if cmd == "/stop":
@@ -2337,6 +2338,7 @@ async def handle_callback(
         cs.has_session = False
         cs.conversation_id = ""
         cs.codex_thread_id = ""
+        cs.last_turn_engine = ""
         clear_chat_history(cs.chat_dir)
         rep = _render_settings(cs, cfg)
         return BridgeReply(text=rep.text, keyboard=rep.keyboard, toast="Сессия сброшена")
@@ -2435,6 +2437,7 @@ async def handle_callback(
         cs.has_session = False
         cs.conversation_id = ""
         cs.codex_thread_id = ""
+        cs.last_turn_engine = ""
         cs.turn_count = 0
         clear_chat_history(cs.chat_dir)
         kb: InlineKeyboard = [

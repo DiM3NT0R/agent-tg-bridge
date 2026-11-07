@@ -40,6 +40,7 @@ class ChatState:
     conversation_id: str = "" # UUID of the currently selected conversation
     codex_thread_id: str = "" # UUID of the active Codex session
     engine: str = "" # "" (auto based on model) | "agy" | "codex"
+    last_turn_engine: str = "" # engine that executed the last turn (for cross-engine handoff)
     context_strategy: str = "compact" # "compact" | "full" | "clean"
     thinking: str = "live" # "live" (live in status) | "all" (+expandable quote) | "off"
     projects: list[dict[str, str]] = field(default_factory=list) # [{'id': '...', 'snippet': '...'}]
@@ -114,6 +115,7 @@ def _safe_chat_state(chats_root: Path, raw: dict) -> ChatState | None:
         conversation_id=raw.get("conversation_id", "") if isinstance(raw.get("conversation_id"), str) else "",
         codex_thread_id=raw.get("codex_thread_id", "") if isinstance(raw.get("codex_thread_id"), str) else "",
         engine=raw.get("engine", "") if isinstance(raw.get("engine"), str) else "",
+        last_turn_engine=raw.get("last_turn_engine", "") if isinstance(raw.get("last_turn_engine"), str) else "",
         context_strategy=raw.get("context_strategy", "compact") if isinstance(raw.get("context_strategy"), str) else "compact",
         thinking=raw.get("thinking", "live") if isinstance(raw.get("thinking"), str) else "live",
         projects=projects,

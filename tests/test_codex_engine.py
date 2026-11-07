@@ -100,19 +100,27 @@ def test_get_available_codex_models():
 
 
 def test_context_compactor_handoff():
-    cs = ChatState(chat_dir="/tmp", engine="agy", conversation_id="conv-123")
+    cs = ChatState(chat_dir="/tmp", engine="agy", last_turn_engine="agy", conversation_id="conv-123")
     prompt = "Fix the login bug"
 
-    # Switching from agy to codex with no active codex session
+    # Switching from agy to codex (even if cs.engine was already set to codex by /model picker!)
+    cs.engine = "codex"
     prepared = prepare_turn_prompt(prompt, cs, target_engine="codex")
     assert "[Контекст: переключение движка с AGY на CODEX]" in prepared
     assert "Fix the login bug" in prepared
 
-    # Same engine -> prompt unchanged
-    cs.engine = "codex"
+    # Same engine as last_turn_engine -> prompt unchanged
+    cs.last_turn_engine = "codex"
     cs.codex_thread_id = "thread-xyz"
     same = prepare_turn_prompt("Another question", cs, target_engine="codex")
     assert same == "Another question"
+
+    # Switching back from codex to agy, then to codex again WITH existing codex_thread_id
+    # must STILL inject handoff digest so Codex sees the intermediate AGY turns!
+    cs.last_turn_engine = "agy"
+    switched_again = prepare_turn_prompt("Continue after agy", cs, target_engine="codex")
+    assert "[Контекст: переключение движка с AGY на CODEX]" in switched_again
+    assert "Continue after agy" in switched_again
 
 
 def test_split_thoughts_and_final():

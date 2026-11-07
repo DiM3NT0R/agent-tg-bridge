@@ -121,14 +121,14 @@ def get_agy_transcript_recent_turns(conversation_id: str, limit: int = 4) -> lis
     cur_user = ""
     try:
         lines = transcript_path.read_text(encoding="utf-8", errors="replace").splitlines()
-        for raw in lines[-120:]:
+        for raw in lines[-200:]:
             try:
                 step = json.loads(raw)
             except Exception:
                 continue
             stype = step.get("type")
             content = str(step.get("content") or "").strip()
-            if stype == "USER_INPUT" and content:
+            if (stype == "USER_INPUT" or (stype == "GENERIC" and "<USER_REQUEST>" in content)) and content:
                 if "<USER_REQUEST>" in content and "</USER_REQUEST>" in content:
                     content = content.split("<USER_REQUEST>", 1)[1].split("</USER_REQUEST>", 1)[0].strip()
                 if "\n\n[Please respond in Russian" in content:
@@ -150,8 +150,12 @@ def get_openai_history_messages(
 ) -> list[dict[str, str]]:
     """Return OpenAI-format [{'role': 'user', ...}, {'role': 'assistant', ...}] history messages."""
     entries = load_chat_history(chat_dir, limit=limit)
-    if not entries and conversation_id:
-        entries = get_agy_transcript_recent_turns(conversation_id, limit=limit)
+    if len(entries) < limit and conversation_id:
+        agy_turns = get_agy_transcript_recent_turns(conversation_id, limit=limit)
+        if agy_turns:
+            seen_users = {str(it.get("user") or "").strip()[:120] for it in entries}
+            merged = [t for t in agy_turns if str(t.get("user") or "").strip()[:120] not in seen_users] + entries
+            entries = merged[-limit:]
     msgs: list[dict[str, str]] = []
     for item in entries:
         u = str(item.get("user") or "").strip()
@@ -268,14 +272,18 @@ def build_handoff_digest(
         lines.append(f"• Текущий контекст/задача: {prev_summary}")
 
     # 1b. Recent conversation turns from local history or transcript
-    recent_turns = load_chat_history(chat_dir, limit=3)
-    if not recent_turns and conversation_id:
-        recent_turns = get_agy_transcript_recent_turns(conversation_id, limit=3)
+    recent_turns = load_chat_history(chat_dir, limit=4)
+    if conversation_id and (not recent_turns or from_engine == "agy"):
+        agy_turns = get_agy_transcript_recent_turns(conversation_id, limit=4)
+        if agy_turns:
+            seen_users = {str(it.get("user") or "").strip()[:120] for it in recent_turns}
+            merged = [t for t in agy_turns if str(t.get("user") or "").strip()[:120] not in seen_users] + recent_turns
+            recent_turns = merged[-4:]
     if recent_turns:
-        lines.append("• Недавние сообщения в диалоге:")
+        lines.append("• Недавние сообщения в диалоге (из предыдущего движка):")
         for rt in recent_turns:
-            u_snip = str(rt.get("user") or "").strip().replace("\n", " ")[:240]
-            a_snip = str(rt.get("assistant") or "").strip().replace("\n", " ")[:360]
+            u_snip = str(rt.get("user") or "").strip().replace("\n", " ")[:400]
+            a_snip = str(rt.get("assistant") or "").strip().replace("\n", " ")[:600]
             lines.append(f"  - Пользователь: {u_snip}")
             lines.append(f"  - Ассистент: {a_snip}")
 
@@ -295,27 +303,38 @@ def prepare_turn_prompt(
     cs: "ChatState",
     target_engine: str,
 ) -> str:
-    """Prefix user prompt with handoff digest if switching engines for the first time."""
-    current_engine = getattr(cs, "engine", "") or "agy"
+    """Prefix user prompt with handoff digest whenever switching between engines."""
+    prev_engine = getattr(cs, "last_turn_engine", "")
+    if not prev_engine:
+        # Fallback for chats that haven't recorded last_turn_engine yet:
+        # check the last entry in .bridge_history.jsonl, or cs.engine, or infer from active session IDs
+        hist = load_chat_history(getattr(cs, "chat_dir", ""), limit=1)
+        if hist and hist[-1].get("engine"):
+            prev_engine = str(hist[-1]["engine"])
+        elif getattr(cs, "engine", "") and getattr(cs, "engine", "") != target_engine:
+            prev_engine = getattr(cs, "engine", "")
+        elif target_engine != "agy" and getattr(cs, "conversation_id", ""):
+            prev_engine = "agy"
+        elif target_engine != "codex" and getattr(cs, "codex_thread_id", ""):
+            prev_engine = "codex"
+        else:
+            prev_engine = getattr(cs, "engine", "") or "agy"
 
-    # If engine changed, build handoff digest
-    if current_engine != target_engine:
-        # Check if target engine already has an active session
-        has_target_session = False
-        if target_engine == "codex" and getattr(cs, "codex_thread_id", ""):
-            has_target_session = True
-        elif target_engine == "agy" and getattr(cs, "conversation_id", ""):
-            has_target_session = True
+    # Normalize engine names
+    norm_prev = "openai" if prev_engine == "openai_compat" else prev_engine
+    norm_target = "openai" if target_engine == "openai_compat" else target_engine
 
-        # If target engine has NO active session, inject handoff digest to boot it
-        if not has_target_session:
-            digest = build_handoff_digest(
-                chat_dir=cs.chat_dir,
-                from_engine=current_engine,
-                to_engine=target_engine,
-                conversation_id=getattr(cs, "conversation_id", ""),
-                codex_thread_id=getattr(cs, "codex_thread_id", ""),
-            )
-            return f"{digest}\n\n[Запрос пользователя]:\n{user_prompt}"
+    # Always inject handoff digest when switching from one engine to another,
+    # even if the target engine already has an older resumed session!
+    # Otherwise a resumed session on the target engine misses all turns that happened on the previous engine.
+    if norm_prev and norm_prev != norm_target:
+        digest = build_handoff_digest(
+            chat_dir=cs.chat_dir,
+            from_engine=norm_prev,
+            to_engine=norm_target,
+            conversation_id=getattr(cs, "conversation_id", ""),
+            codex_thread_id=getattr(cs, "codex_thread_id", ""),
+        )
+        return f"{digest}\n\n[Запрос пользователя]:\n{user_prompt}"
 
     return user_prompt
