@@ -384,7 +384,14 @@ async def execute_codex(
     codex_path: str = "/usr/local/bin/codex",
 ) -> tuple[str, int]:
     """Run one codex turn with inline status updater and token tracking."""
-    from src.codex_runner import run_codex
+    from src.codex_runner import find_codex_bin, install_codex, run_codex
+
+    resolved_path = find_codex_bin(codex_path)
+    if not resolved_path and not os.path.exists(codex_path):
+        ok, _ = await install_codex()
+        if ok:
+            resolved_path = find_codex_bin()
+    target_codex_path = resolved_path or codex_path
 
     status_msg_id = None
     run_nonce = secrets.token_urlsafe(6)
@@ -453,7 +460,7 @@ async def execute_codex(
             thread_id=cs.codex_thread_id,
             model=cs.model,
             effort=cs.effort,
-            codex_path=codex_path,
+            codex_path=target_codex_path,
             timeout=timeout_s,
             on_event=handle_codex_event,
             stop_event=stop_event,

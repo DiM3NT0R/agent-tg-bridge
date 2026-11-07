@@ -326,3 +326,41 @@ async def test_refresh_account_tokens_and_keepalive(fake_env, monkeypatch):
         res = await refresh_all_codex_accounts(force=True, accounts_dir=accounts_dir, auth_path=auth_file)
         assert len(res) == 1
         assert list(res.values())[0][0] is True
+
+
+@pytest.mark.asyncio
+async def test_accounts_menu_not_installed_shows_install_button(fake_env, monkeypatch):
+    codex_home, accounts_dir, auth_file = fake_env
+    monkeypatch.setattr("src.codex_accounts.get_accounts_dir", lambda *_: accounts_dir)
+    monkeypatch.setattr("src.codex_accounts.get_active_auth_path", lambda *_: auth_file)
+    monkeypatch.setattr("src.codex_runner.find_codex_bin", lambda *_: None)
+    monkeypatch.setattr("src.codex_runner.check_codex_auth", AsyncMock(return_value=(False, "Codex CLI не установлен")))
+
+    cs = ChatState(chat_dir=str(codex_home))
+    cfg = _dummy_cfg()
+
+    msg = InboundMessage(update_id=1, message_id=10, chat_id=100, user_id=42, text="/account")
+    reply = await handle_text_command(msg, cs, cfg)
+    assert reply is not None
+    assert "Не установлен (требуется CLI)" in reply.text
+
+    # Action row should contain install button
+    buttons = [btn for row in reply.keyboard for btn in row]
+    install_btn = next((b for b in buttons if b.get("callback_data") == "auth:install_codex"), None)
+    assert install_btn is not None
+    assert "Установить Codex CLI" in install_btn["text"]
+
+
+@pytest.mark.asyncio
+async def test_run_install_codex_flow(fake_env, monkeypatch):
+    codex_home, accounts_dir, auth_file = fake_env
+    tg_mock = AsyncMock()
+    from src.commands import _run_install_codex_flow
+
+    monkeypatch.setattr("src.codex_runner.install_codex", AsyncMock(return_value=(True, "Installed")))
+    monkeypatch.setattr("src.codex_runner.find_codex_bin", lambda *_: "/usr/bin/codex")
+
+    await _run_install_codex_flow(tg_mock, 100, 20)
+    assert tg_mock.edit_message_text.call_count == 2
+    last_call = tg_mock.edit_message_text.call_args_list[-1]
+    assert "Codex CLI успешно установлен" in last_call[0][2]

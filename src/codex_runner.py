@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import glob
 import html
 import json
 import logging
 import os
 import re
+import shutil
 import signal
 from dataclasses import dataclass
 from typing import Awaitable, Callable
@@ -55,6 +57,131 @@ def _reap_zombies() -> None:
                 break
     except (ChildProcessError, OSError):
         pass
+
+
+def find_codex_bin(custom_path: str | None = None) -> str | None:
+    """Find the codex CLI executable in PATH or standard install locations."""
+    if custom_path:
+        try:
+            if os.path.isfile(custom_path) and os.access(custom_path, os.X_OK):
+                return custom_path
+        except Exception:
+            pass
+
+    # Check PATH
+    try:
+        found = shutil.which("codex")
+        if found and os.path.isfile(found) and os.access(found, os.X_OK):
+            return found
+    except Exception:
+        pass
+
+    # Check common system and npm paths
+    candidates = [
+        "/usr/local/bin/codex",
+        "/usr/bin/codex",
+        os.path.expanduser("~/.npm-global/bin/codex"),
+        os.path.expanduser("~/.local/bin/codex"),
+    ]
+    for c in candidates:
+        try:
+            if os.path.isfile(c) and os.access(c, os.X_OK):
+                return c
+        except Exception:
+            pass
+
+    # Wildcard search for custom/versioned directories like /usr/local/lib/codex-*/bin/codex
+    try:
+        for c in sorted(glob.glob("/usr/local/lib/codex*/bin/codex"), reverse=True):
+            if os.path.isfile(c) and os.access(c, os.X_OK):
+                return c
+    except Exception:
+        pass
+
+    return None
+
+
+async def install_codex() -> tuple[bool, str]:
+    """Attempt to install OpenAI Codex CLI (@openai/codex) via npm.
+
+    Returns:
+        (success: bool, message: str)
+    """
+    existing = find_codex_bin()
+    if existing:
+        return True, f"Codex CLI уже установлен: {existing}"
+
+    # 1. Locate npm
+    npm_bin = shutil.which("npm")
+    if not npm_bin:
+        for c in ("/usr/bin/npm", "/usr/local/bin/npm"):
+            if os.path.isfile(c) and os.access(c, os.X_OK):
+                npm_bin = c
+                break
+
+    # 2. If npm not found, check if apt-get is available to install nodejs and npm
+    if not npm_bin:
+        apt_bin = shutil.which("apt-get")
+        is_root = hasattr(os, "geteuid") and os.geteuid() == 0
+        if apt_bin and is_root:
+            LOG.info("npm not found. Attempting apt-get install -y nodejs npm...")
+            try:
+                p_up = await asyncio.create_subprocess_exec(
+                    apt_bin, "update", "-qq",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await p_up.communicate()
+                p_in = await asyncio.create_subprocess_exec(
+                    apt_bin, "install", "-y", "-qq", "nodejs", "npm",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await p_in.communicate()
+                npm_bin = shutil.which("npm") or ("/usr/bin/npm" if os.path.isfile("/usr/bin/npm") else None)
+            except Exception as e:
+                LOG.warning("apt-get install nodejs npm failed: %s", e)
+
+    if not npm_bin:
+        return False, "Node.js / npm не найден в системе. Установите npm командой: apt-get install -y npm nodejs"
+
+    LOG.info("Installing @openai/codex via %s...", npm_bin)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            npm_bin, "install", "-g", "@openai/codex",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        out = (stdout.decode("utf-8", errors="replace") + "\n" + stderr.decode("utf-8", errors="replace")).strip()
+    except Exception as e:
+        return False, f"Ошибка запуска npm: {e}"
+
+    found = find_codex_bin()
+    if found:
+        if found != "/usr/local/bin/codex" and not os.path.exists("/usr/local/bin/codex"):
+            try:
+                os.symlink(found, "/usr/local/bin/codex")
+            except Exception:
+                pass
+        return True, f"Codex CLI успешно установлен: {found}"
+
+    # Fallback for unprivileged users: try prefix ~/.npm-global
+    npm_global = os.path.expanduser("~/.npm-global")
+    try:
+        proc2 = await asyncio.create_subprocess_exec(
+            npm_bin, "install", "-g", "--prefix", npm_global, "@openai/codex",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await proc2.communicate()
+        found = find_codex_bin()
+        if found:
+            return True, f"Codex CLI успешно установлен: {found}"
+    except Exception as e:
+        LOG.warning("npm prefix fallback failed: %s", e)
+
+    return False, f"Установка @openai/codex не удалась (код {proc.returncode}):\n{out[-300:]}"
 
 
 def _build_codex_args(
@@ -104,8 +231,20 @@ async def run_codex(
 ) -> CodexResult:
     """Run codex exec (or resume) with JSON streaming output."""
     _reap_zombies()
+    resolved_path = find_codex_bin(codex_path)
+    if not resolved_path and not os.path.exists(codex_path):
+        ok, _ = await install_codex()
+        if ok:
+            resolved_path = find_codex_bin()
+    if not resolved_path and not os.path.exists(codex_path):
+        return CodexResult(
+            text="⚠️ Codex CLI не найден на сервере. Установите его через меню /settings или командой <code>npm install -g @openai/codex</code>.",
+            exit_code=127,
+            stderr="Codex CLI binary not found",
+        )
+    target_bin = resolved_path or codex_path
     args = _build_codex_args(
-        codex_path=codex_path,
+        codex_path=target_bin,
         prompt=prompt,
         thread_id=thread_id,
         model=model,
@@ -417,9 +556,13 @@ _DEVICE_CODE_RE = re.compile(r"\b([A-Z0-9]{4,5}-[A-Z0-9]{4,5})\b")
 
 async def check_codex_auth(codex_path: str = "/usr/local/bin/codex") -> tuple[bool, str]:
     """Check if codex is authenticated."""
+    resolved_path = find_codex_bin(codex_path)
+    if not resolved_path and not os.path.exists(codex_path):
+        return False, "Codex CLI не установлен в системе"
+    target = resolved_path or codex_path
     try:
         proc = await asyncio.create_subprocess_exec(
-            codex_path, "login", "status",
+            target, "login", "status",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -432,6 +575,8 @@ async def check_codex_auth(codex_path: str = "/usr/local/bin/codex") -> tuple[bo
                     return True, line.strip()
             return True, out
         return False, out
+    except FileNotFoundError:
+        return False, "Codex CLI не установлен в системе"
     except Exception as e:
         return False, str(e)
 
@@ -447,17 +592,27 @@ async def run_codex_device_auth(
     Waits for the user to authenticate in their browser.
     """
     _reap_zombies()
+    resolved_path = find_codex_bin(codex_path)
+    if not resolved_path and not os.path.exists(codex_path):
+        ok, inst_msg = await install_codex()
+        if ok:
+            resolved_path = find_codex_bin()
+        else:
+            return False, f"Codex CLI не найден на сервере. Ошибка автоматической установки: {inst_msg}"
+    target = resolved_path or codex_path
     try:
         env = dict(os.environ)
         env["NO_COLOR"] = "1"
         env["TERM"] = "dumb"
         proc = await asyncio.create_subprocess_exec(
-            codex_path, "login", "--device-auth",
+            target, "login", "--device-auth",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             env=env,
             start_new_session=True,
         )
+    except FileNotFoundError:
+        return False, f"Не удалось запустить codex login: [Errno 2] No such file or directory: '{target}'"
     except Exception as e:
         return False, f"Не удалось запустить codex login: {e}"
 
@@ -540,9 +695,13 @@ async def queue_codex_message(
     codex_path: str = "/usr/local/bin/codex",
 ) -> tuple[bool, str]:
     """Queue a message to an active or existing codex thread."""
+    resolved_path = find_codex_bin(codex_path)
+    if not resolved_path and not os.path.exists(codex_path):
+        return False, "Codex CLI не установлен в системе"
+    target = resolved_path or codex_path
     try:
         proc = await asyncio.create_subprocess_exec(
-            codex_path, "queue", "--thread", thread_id, "--message", message,
+            target, "queue", "--thread", thread_id, "--message", message,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -550,5 +709,7 @@ async def queue_codex_message(
         if proc.returncode == 0:
             return True, stdout.decode().strip()
         return False, stderr.decode().strip()
+    except FileNotFoundError:
+        return False, "Codex CLI не установлен в системе"
     except Exception as e:
         return False, str(e)

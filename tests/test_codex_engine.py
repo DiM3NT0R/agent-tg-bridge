@@ -12,6 +12,8 @@ from src.codex_runner import (
     _build_codex_args,
     _split_thoughts_and_final,
     check_codex_auth,
+    find_codex_bin,
+    install_codex,
     run_codex_device_auth,
 )
 from src.context_compactor import build_handoff_digest, prepare_turn_prompt
@@ -181,3 +183,116 @@ async def test_run_codex_device_auth_with_ansi_colors():
         assert ok is True
         assert reported_url == "https://auth.openai.com/codex/device"
         assert reported_code == "3MZW-PYSFB"
+
+
+def test_find_codex_bin(tmp_path: Path, monkeypatch):
+    # Non-existent path returns fallback or None
+    monkeypatch.setattr("shutil.which", lambda cmd: None)
+    monkeypatch.setattr("os.path.isfile", lambda p: False)
+    assert find_codex_bin("/non/existent/codex") is None
+
+    # Custom executable exists
+    fake_bin = tmp_path / "my_codex"
+    fake_bin.write_text("#!/bin/sh\nexit 0")
+    fake_bin.chmod(0o755)
+    monkeypatch.undo()
+    assert find_codex_bin(str(fake_bin)) == str(fake_bin)
+
+
+@pytest.mark.asyncio
+async def test_install_codex_already_installed(monkeypatch):
+    monkeypatch.setattr("src.codex_runner.find_codex_bin", lambda *_: "/usr/local/bin/codex")
+    ok, msg = await install_codex()
+    assert ok is True
+    assert "уже установлен" in msg
+
+
+@pytest.mark.asyncio
+async def test_install_codex_npm_missing(monkeypatch):
+    monkeypatch.setattr("src.codex_runner.find_codex_bin", lambda *_: None)
+    monkeypatch.setattr("shutil.which", lambda cmd: None)
+    monkeypatch.setattr("os.path.isfile", lambda p: False)
+    ok, msg = await install_codex()
+    assert ok is False
+    assert "Node.js / npm не найден" in msg
+
+
+@pytest.mark.asyncio
+async def test_install_codex_npm_success(monkeypatch):
+    monkeypatch.setattr("shutil.which", lambda cmd: "/usr/bin/npm" if cmd == "npm" else None)
+    monkeypatch.setattr("os.path.isfile", lambda p: p == "/usr/bin/npm")
+    monkeypatch.setattr("os.access", lambda p, mode: True)
+
+    calls = []
+    found_after_install = False
+
+    def fake_find(*_):
+        return "/usr/bin/codex" if found_after_install else None
+
+    monkeypatch.setattr("src.codex_runner.find_codex_bin", fake_find)
+
+    with patch("asyncio.create_subprocess_exec") as mock_exec:
+        proc = MagicMock()
+        proc.returncode = 0
+
+        async def fake_comm():
+            nonlocal found_after_install
+            found_after_install = True
+            return b"added 7 packages", b""
+
+        proc.communicate = fake_comm
+        mock_exec.return_value = proc
+
+        ok, msg = await install_codex()
+        assert ok is True
+        assert "успешно установлен" in msg
+        assert "/usr/bin/codex" in msg
+
+
+@pytest.mark.asyncio
+async def test_check_codex_auth_not_installed(monkeypatch):
+    monkeypatch.setattr("src.codex_runner.find_codex_bin", lambda *_: None)
+    monkeypatch.setattr("os.path.exists", lambda p: False)
+    ok, msg = await check_codex_auth("/path/to/missing/codex")
+    assert ok is False
+    assert "не установлен" in msg
+
+
+@pytest.mark.asyncio
+async def test_run_codex_device_auth_missing_triggers_install(monkeypatch):
+    # Missing initially, install succeeds, then proc runs
+    state = {"installed": False}
+
+    def fake_find(*_):
+        return "/usr/bin/codex" if state["installed"] else None
+
+    async def fake_install():
+        state["installed"] = True
+        return True, "installed"
+
+    monkeypatch.setattr("src.codex_runner.find_codex_bin", fake_find)
+    monkeypatch.setattr("src.codex_runner.install_codex", fake_install)
+    monkeypatch.setattr("os.path.exists", lambda p: False)
+
+    with patch("asyncio.create_subprocess_exec") as mock_exec:
+        proc = MagicMock()
+        proc.pid = 999
+        mock_stdout = AsyncMock()
+        mock_stdout.readline = AsyncMock(
+            side_effect=[
+                b"https://auth.openai.com/codex/device\n",
+                b"CODE-12345\n",
+                b"",
+            ]
+        )
+        proc.stdout = mock_stdout
+        proc.wait = AsyncMock(return_value=0)
+        proc.returncode = 0
+        mock_exec.return_value = proc
+
+        async def on_code(u, c):
+            pass
+
+        ok, msg = await run_codex_device_auth(on_code, codex_path="/missing/codex")
+        assert ok is True
+        assert state["installed"] is True

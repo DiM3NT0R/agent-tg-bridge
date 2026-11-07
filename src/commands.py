@@ -512,19 +512,28 @@ _ACTIVE_AUTH_CANCELS: dict[int, asyncio.Event] = {}
 
 
 async def _render_auth_card() -> BridgeReply:
-    from src.codex_runner import check_codex_auth
+    from src.codex_runner import check_codex_auth, find_codex_bin
     from src.codex_accounts import (
         load_saved_accounts,
         read_active_auth_data,
         parse_auth_data,
     )
 
+    codex_bin = find_codex_bin()
     codex_ok, codex_status = await check_codex_auth()
     saved_accs = load_saved_accounts()
+    is_installed = (codex_bin is not None) or codex_ok
 
     agy_status = "Авторизован (OAuth Google)"
-    codex_status_text = f"Авторизован ({codex_status})" if codex_ok else "Не авторизован"
-    codex_icon = "🟢" if codex_ok else "⚪️"
+    if not is_installed:
+        codex_status_text = "Не установлен (требуется CLI)"
+        codex_icon = "⚠️"
+    elif codex_ok:
+        codex_status_text = f"Авторизован ({codex_status})"
+        codex_icon = "🟢"
+    else:
+        codex_status_text = "Не авторизован"
+        codex_icon = "⚪️"
 
     lines = [
         "🔐 <b>Авторизация и аккаунты CLI-агентов</b>\n",
@@ -568,7 +577,9 @@ async def _render_auth_card() -> BridgeReply:
 
     # Actions keyboard
     action_row: list[dict[str, Any]] = []
-    if codex_ok:
+    if not is_installed:
+        action_row.append({"text": "📦 Установить Codex CLI", "callback_data": "auth:install_codex"})
+    elif codex_ok:
         action_row.append({"text": "➕ Добавить аккаунт", "callback_data": "auth:codex"})
     else:
         action_row.append({"text": "🔑 Войти в ChatGPT (OAuth)", "callback_data": "auth:codex"})
@@ -979,7 +990,7 @@ async def _handle_wizard_text_input(
 
 
 async def _run_device_auth_flow(tg: Any, chat_id: int, message_id: int):
-    from src.codex_runner import run_codex_device_auth
+    from src.codex_runner import find_codex_bin, install_codex, run_codex_device_auth
     from src.codex_accounts import (
         backup_active_auth_for_login,
         restore_backup_after_aborted_login,
@@ -987,6 +998,35 @@ async def _run_device_auth_flow(tg: Any, chat_id: int, message_id: int):
         read_active_auth_data,
         save_account_data,
     )
+
+    bin_path = find_codex_bin()
+    if not bin_path:
+        try:
+            await tg.edit_message_text(
+                chat_id,
+                message_id,
+                "📦 <b>Codex CLI не обнаружен на сервере</b>\n\n"
+                "⏳ <i>Выполняется автоматическая установка <code>@openai/codex</code> через npm...</i>\n"
+                "Пожалуйста, подождите минуту.",
+                keyboard=[[{"text": "❌ Отмена", "callback_data": "auth:cancel"}]],
+            )
+        except Exception as e:
+            LOG.warning("Failed to update auth message: %s", e)
+
+        ok_inst, msg_inst = await install_codex()
+        if not ok_inst:
+            await tg.edit_message_text(
+                chat_id,
+                message_id,
+                f"⚠️ <b>Не удалось установить Codex CLI</b>\n\n{html.escape(msg_inst)}\n\n"
+                "Вы можете повторить попытку или выполнить на сервере команду:\n"
+                "<code>npm install -g @openai/codex</code>",
+                keyboard=[
+                    [{"text": "🔄 Повторить установку", "callback_data": "auth:install_codex"}],
+                    [{"text": "← К управлению аккаунтами", "callback_data": "nav:auth"}],
+                ],
+            )
+            return
 
     backup_active_auth_for_login()
 
@@ -1035,20 +1075,65 @@ async def _run_device_auth_flow(tg: Any, chat_id: int, message_id: int):
             )
         else:
             restore_backup_after_aborted_login()
+            err_keyboard = [
+                [{"text": "🔄 Попробовать снова", "callback_data": "auth:codex"}],
+            ]
+            if not find_codex_bin():
+                err_keyboard.insert(0, [{"text": "📦 Установить Codex CLI", "callback_data": "auth:install_codex"}])
+            err_keyboard.append([{"text": "← К управлению аккаунтами", "callback_data": "nav:auth"}])
             await tg.edit_message_text(
                 chat_id,
                 message_id,
-                f"⚠️ <b>Авторизация не завершена</b>\n\n{msg}",
-                keyboard=[
-                    [{"text": "🔄 Попробовать снова", "callback_data": "auth:codex"}],
-                    [{"text": "← К управлению аккаунтами", "callback_data": "nav:auth"}],
-                ],
+                f"⚠️ <b>Авторизация не завершена</b>\n\n{html.escape(msg)}",
+                keyboard=err_keyboard,
             )
     except Exception as e:
         restore_backup_after_aborted_login()
         LOG.error("Device auth flow failed: %s", e)
     finally:
         _ACTIVE_AUTH_CANCELS.pop(chat_id, None)
+
+
+async def _run_install_codex_flow(tg: Any, chat_id: int, message_id: int):
+    from src.codex_runner import find_codex_bin, install_codex
+    try:
+        await tg.edit_message_text(
+            chat_id,
+            message_id,
+            "⏳ <b>Установка OpenAI Codex CLI...</b>\n\n"
+            "Выполняется установка пакета <code>@openai/codex</code> через npm.\n"
+            "Пожалуйста, подождите минуту...",
+            keyboard=[[{"text": "← К управлению аккаунтами", "callback_data": "nav:auth"}]],
+        )
+    except Exception as e:
+        LOG.warning("Failed to edit install message: %s", e)
+
+    ok, msg = await install_codex()
+    bin_path = find_codex_bin()
+    if ok and bin_path:
+        await tg.edit_message_text(
+            chat_id,
+            message_id,
+            f"✅ <b>Codex CLI успешно установлен!</b>\n\n"
+            f"Исполняемый файл: <code>{bin_path}</code>\n\n"
+            "Теперь вы можете авторизовать аккаунт OpenAI Codex через OAuth или добавить API-ключ.",
+            keyboard=[
+                [{"text": "🔑 Войти в ChatGPT (OAuth)", "callback_data": "auth:codex"}],
+                [{"text": "← К управлению аккаунтами", "callback_data": "nav:auth"}],
+            ],
+        )
+    else:
+        await tg.edit_message_text(
+            chat_id,
+            message_id,
+            f"❌ <b>Ошибка установки Codex CLI</b>\n\n{html.escape(msg)}\n\n"
+            "Вы можете повторить попытку или выполнить в терминале сервера:\n"
+            "<code>npm install -g @openai/codex</code>",
+            keyboard=[
+                [{"text": "🔄 Повторить попытку", "callback_data": "auth:install_codex"}],
+                [{"text": "← К управлению аккаунтами", "callback_data": "nav:auth"}],
+            ],
+        )
 
 
 async def _handle_codex_key_cmd(key_arg: str, msg: "InboundMessage", tg: Any = None) -> BridgeReply:
@@ -1857,6 +1942,13 @@ async def handle_callback(
             "⏳ <b>Запуск авторизации OpenAI Codex...</b>\n\nОжидайте ссылку и одноразовый код.",
             keyboard=[[{"text": "❌ Отмена", "callback_data": "auth:cancel"}]],
             toast="Запуск авторизации...",
+        )
+    if data == "auth:install_codex":
+        if tg:
+            asyncio.create_task(_run_install_codex_flow(tg, cq.chat_id, cq.message_id))
+        return BridgeReply(
+            "⏳ <b>Запуск установки OpenAI Codex CLI (@openai/codex)...</b>",
+            toast="Установка Codex...",
         )
     if data == "auth:cancel":
         cancel_ev = _ACTIVE_AUTH_CANCELS.get(cq.chat_id)
