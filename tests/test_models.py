@@ -1,7 +1,9 @@
 """Tests for dynamic model discovery in src.models."""
 from __future__ import annotations
 
+import json
 import subprocess
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -90,3 +92,35 @@ def test_extract_model_and_effort() -> None:
     assert extract_model_and_effort("gemini-4-argon-low", "high") == ("gemini-4-argon", "high")
     assert extract_model_and_effort("gemini-4-argon", "") == ("gemini-4-argon", "")
     assert extract_model_and_effort("gpt-6.1-sol", "medium") == ("gpt-6.1-sol", "medium")
+
+
+def test_get_available_codex_models_filters_deprecated_and_ensures_gpt6(tmp_path: Path, monkeypatch) -> None:
+    from src.models import get_available_codex_models
+
+    fake_cache = tmp_path / "models_cache.json"
+    fake_cache.write_text(json.dumps({
+        "models": [
+            {"slug": "gpt-5.4", "display_name": "GPT-5.4", "visibility": "list"},
+            {"slug": "gpt-5.4-mini", "display_name": "GPT-5.4-Mini", "visibility": "list"},
+            {"slug": "gpt-5.5", "display_name": "GPT-5.5", "visibility": "list"},
+            {"slug": "gpt-5.6-sol", "display_name": "GPT-5.6-Sol", "visibility": "list"},
+            {"slug": "gpt-reserve", "display_name": "GPT-Reserve", "visibility": "hide"},
+            {"slug": "codex-auto-review", "display_name": "Codex Auto Review", "visibility": "hide"},
+        ]
+    }))
+    monkeypatch.setattr("os.path.expanduser", lambda p: str(fake_cache) if "models_cache.json" in p else p)
+
+    models = get_available_codex_models(force_refresh=True)
+    slugs = [slug for slug, _ in models]
+
+    # Stale 5.4 / 5.5 and hidden models must be filtered out
+    assert "gpt-5.4" not in slugs
+    assert "gpt-5.4-mini" not in slugs
+    assert "gpt-5.5" not in slugs
+    assert "gpt-reserve" not in slugs
+    assert "codex-auto-review" not in slugs
+
+    # Modern flagship models must be injected at the top
+    assert slugs[0] == "gpt-6.1-sol"
+    assert "gpt-6-astra" in slugs
+    assert "gpt-6.1-terra" in slugs

@@ -33,9 +33,7 @@ FALLBACK_CODEX_MODELS: list[tuple[str, str]] = [
     ("gpt-6-astra", "GPT-6 Astra (Deep Reasoning)"),
     ("gpt-6.1-terra", "GPT-6.1 Terra (Balanced)"),
     ("gpt-6-sol", "GPT-6 Sol (Fast)"),
-    ("gpt-5.6-sol", "GPT-5.6 Sol (Lightweight)"),
-    ("gpt-5.6-terra", "GPT-5.6 Terra (Fast)"),
-    ("gpt-5.6-luna", "GPT-5.6 Luna (Ultra Fast)"),
+    ("gpt-6-luna", "GPT-6 Luna (Ultra Fast)"),
 ]
 
 _CACHE_TTL_S = 300.0  # 5 minutes
@@ -154,33 +152,61 @@ def get_available_models(
 
 
 def get_available_codex_models(force_refresh: bool = False) -> list[tuple[str, str]]:
-    """Fetch available Codex models from ~/.codex/models_cache.json or fallback."""
+    """Fetch available Codex models from ~/.codex/models_cache.json or fallback, ensuring modern models are always present."""
     global _cached_codex_models, _cached_codex_at
     now = time.time()
     if not force_refresh and _cached_codex_models is not None and (now - _cached_codex_at) < _CACHE_TTL_S:
         return _cached_codex_models
 
+    items: list[tuple[str, str]] = []
+    seen: set[str] = set()
     cache_file = os.path.expanduser("~/.codex/models_cache.json")
+
+    # Obsolete / deprecated model prefixes to filter out by default
+    deprecated_prefixes = ("gpt-5.4", "gpt-5.5")
+
     if os.path.exists(cache_file):
         try:
             with open(cache_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            items = []
             for m in data.get("models", []):
                 slug = m.get("slug")
+                if not slug:
+                    continue
+                # Skip internal / hidden / review models
+                if slug in ("codex-auto-review", "gpt-reserve") or m.get("visibility") == "hide":
+                    continue
+                # Skip legacy obsolete models
+                if any(slug.lower().startswith(p) for p in deprecated_prefixes):
+                    continue
                 name = m.get("display_name") or slug
-                if slug and slug != "codex-auto-review":
+                slug_lower = slug.lower()
+                if slug_lower not in seen:
+                    seen.add(slug_lower)
                     items.append((slug, name))
-            if items:
-                _cached_codex_models = items
-                _cached_codex_at = now
-                return items
         except Exception as e:
             LOG.warning("Failed to parse ~/.codex/models_cache.json: %s", e)
 
-    if _cached_codex_models:
-        return _cached_codex_models
-    return list(FALLBACK_CODEX_MODELS)
+    # Ensure modern flagship GPT-6 models are always present even if cache is stale or missing them
+    for fallback_id, fallback_name in FALLBACK_CODEX_MODELS:
+        if fallback_id.lower() not in seen:
+            items.append((fallback_id, fallback_name))
+            seen.add(fallback_id.lower())
+
+    # Sort/prioritize: ensure modern flagship GPT-6 models are at the top
+    priority_order = ["gpt-6.1-sol", "gpt-6-astra", "gpt-6.1-terra", "gpt-6-sol", "gpt-6-luna"]
+    ordered: list[tuple[str, str]] = []
+    for pid in priority_order:
+        match = next((item for item in items if item[0].lower() == pid), None)
+        if match:
+            ordered.append(match)
+    for item in items:
+        if item[0].lower() not in priority_order:
+            ordered.append(item)
+
+    _cached_codex_models = ordered
+    _cached_codex_at = now
+    return ordered
 
 
 def get_available_openai_models() -> list[tuple[str, str]]:

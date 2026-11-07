@@ -204,9 +204,21 @@ def reset_models_config(
     if provider:
         prov = provider.strip().lower()
         if prov in cfg.custom_models:
-            custom_ids = {it["id"].lower() for it in cfg.custom_models[prov]}
             cfg.custom_models[prov] = []
-            cfg.disabled_models = [d for d in cfg.disabled_models if d.lower() not in custom_ids]
+        from src.models import (
+            get_available_models,
+            get_available_codex_models,
+            get_available_openai_models,
+        )
+        if prov == "agy":
+            prov_mids = {m[0].lower() for m in get_available_models(dedup_efforts=True, force_refresh=True)}
+        elif prov == "codex":
+            prov_mids = {m[0].lower() for m in get_available_codex_models(force_refresh=True)}
+        elif prov == "openai":
+            prov_mids = {m[0].lower() for m in get_available_openai_models()}
+        else:
+            prov_mids = set()
+        cfg.disabled_models = [d for d in cfg.disabled_models if d.lower() not in prov_mids]
     else:
         cfg = ModelsConfig()
     save_models_config(cfg, storage_path)
