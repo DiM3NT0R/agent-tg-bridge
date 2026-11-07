@@ -70,6 +70,18 @@ def clean_inbox(workdir: str, max_age_hours: int = 24) -> int:
     return removed
 
 
+def clean_all_inboxes(chats_root: Path | str, max_age_hours: int = 24) -> int:
+    """Clean expired files in .bridge-inbox across all chat directories."""
+    root = Path(chats_root)
+    if not root.exists() or not root.is_dir():
+        return 0
+    total = 0
+    for chat_dir in root.iterdir():
+        if chat_dir.is_dir():
+            total += clean_inbox(str(chat_dir), max_age_hours)
+    return total
+
+
 def list_inbox(workdir: str, limit: int = 5) -> list[str]:
     inbox = Path(workdir) / INBOX_DIR_NAME
     if not inbox.exists():

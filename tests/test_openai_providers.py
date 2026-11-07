@@ -199,6 +199,55 @@ async def test_run_openai_compat_streaming(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_tool_limit_requests_final_answer(tmp_path: Path) -> None:
+    prov = OpenAIProvider(id="cheapai", name="CheapAI", base_url="https://example.com/v1", api_key="test")
+    payloads = []
+
+    def fake_stream(method, url, headers=None, json=None):
+        payloads.append(json.copy())
+        response = AsyncMock()
+        response.status_code = 200
+        async def lines():
+            if len(payloads) == 1:
+                yield 'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read_file","arguments":"{\\"path\\":\\"missing\\"}"}}]},"finish_reason":"tool_calls"}]}'
+            else:
+                yield 'data: {"choices":[{"delta":{"content":"Итог"},"finish_reason":"stop"}]}'
+            yield 'data: [DONE]'
+        response.aiter_lines = lines
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock(return_value=None)
+        return response
+
+    with patch.object(httpx.AsyncClient, "stream", side_effect=fake_stream):
+        result = await run_openai_compat("Проверь", chat_dir=str(tmp_path), provider=prov, max_tool_iterations=1)
+    assert result.exit_code == 0 and result.text == "Итог"
+    assert "tools" in payloads[0] and "tools" not in payloads[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lines", [
+    ['data: [DONE]'],
+    ['data: {"choices":[{"delta":{"content":"partial"}}]}'],
+    ['data: {"error":{"message":"provider failed"}}'],
+    ['data: {"choices":[{"delta":{"content":"partial"},"finish_reason":"length"}]}', 'data: [DONE]'],
+])
+async def test_incomplete_stream_is_not_success(tmp_path: Path, lines: list[str]) -> None:
+    prov = OpenAIProvider(id="cheapai", name="CheapAI", base_url="https://example.com/v1", api_key="test")
+    response = AsyncMock()
+    response.status_code = 200
+    async def aiter_lines():
+        for line in lines:
+            yield line
+    response.aiter_lines = aiter_lines
+    response.__aenter__ = AsyncMock(return_value=response)
+    response.__aexit__ = AsyncMock(return_value=None)
+    with patch.object(httpx.AsyncClient, "stream", return_value=response):
+        result = await run_openai_compat("Hi", chat_dir=str(tmp_path), provider=prov)
+    assert result.exit_code != 0
+    assert result.stderr
+
+
+@pytest.mark.asyncio
 async def test_provider_slash_commands(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     storage = tmp_path / "providers.json"
     monkeypatch.setattr("src.openai_providers._DEFAULT_STORAGE_PATH", storage)
@@ -408,8 +457,8 @@ async def test_provider_wizard_cancel_and_back(tmp_path: Path, monkeypatch: pyte
 
 
 @pytest.mark.asyncio
-async def test_run_openai_compat_with_history_and_reasoning_fallback(tmp_path: Path) -> None:
-    """Verify history_messages are included and reasoning-only responses fall back to thoughts."""
+async def test_run_openai_compat_with_history_and_reasoning_only(tmp_path: Path) -> None:
+    """Reasoning-only response falls back gracefully to thoughts."""
     prov = OpenAIProvider(
         id="cheapai",
         name="CheapAI",
@@ -450,8 +499,7 @@ async def test_run_openai_compat_with_history_and_reasoning_fallback(tmp_path: P
             ],
         )
         assert result.exit_code == 0
-        # Because content delta was empty, final_text must fall back to reasoning_content!
-        assert result.text == "Fallback answer from reasoning"
+        assert "Fallback answer from reasoning" in result.text
         assert len(captured_payloads) == 1
         msgs = captured_payloads[0]["messages"]
         assert msgs[1] == {"role": "user", "content": "My secret code is 42"}

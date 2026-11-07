@@ -116,10 +116,21 @@ async def _execute_local_tool(name: str, args: dict[str, Any], workspace: str) -
         cmd = str(args.get("command") or "").strip()
         if not cmd:
             return "Error: Empty command."
+        proc = None
         try:
+            # Clean environment: do not leak bot token or secret credentials to arbitrary shell commands
+            clean_env = {
+                k: v for k, v in os.environ.items()
+                if not any(w in k.lower() for w in ("token", "secret", "password", "auth", "credential"))
+            }
+            clean_env["HOME"] = os.path.expanduser("~")
+            clean_env["PATH"] = os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")
+
             proc = await asyncio.create_subprocess_shell(
                 cmd,
                 cwd=workspace,
+                env=clean_env,
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -138,7 +149,13 @@ async def _execute_local_tool(name: str, args: dict[str, Any], workspace: str) -
                 output = output[:4096] + "\n...[truncated]...\n" + output[-4096:]
             return output or "(empty output, exit code 0)"
         except asyncio.TimeoutError:
-            return "Error: Command timed out after 45 seconds."
+            if proc:
+                try:
+                    proc.kill()
+                    await asyncio.wait_for(proc.wait(), timeout=2.0)
+                except Exception:
+                    pass
+            return "Error: Command timed out after 45 seconds and was terminated."
         except Exception as exc:
             return f"Error executing command: {exc}"
 
@@ -184,7 +201,7 @@ async def run_openai_compat(
     on_tool: Callable[[str], Awaitable[None]] | None = None,
     on_status: Callable[[str], Awaitable[None]] | None = None,
     stop_event: asyncio.Event | None = None,
-    max_tool_iterations: int = 8,
+    max_tool_iterations: int = 15,
 ) -> OpenAICompatResult:
     """Run an agentic conversational turn against an OpenAI-compatible endpoint."""
     target_model = model or provider.default_model or "gpt-4o"
@@ -213,7 +230,8 @@ async def run_openai_compat(
     use_tools = True
     final_text = ""
 
-    for iteration in range(max_tool_iterations):
+    # Reserve one additional request for a final answer after the tool budget.
+    for iteration in range(max_tool_iterations + 1):
         if stop_event and stop_event.is_set():
             return OpenAICompatResult(
                 text="🛑 Выполнение остановлено пользователем.",
@@ -226,13 +244,15 @@ async def run_openai_compat(
             "messages": messages,
             "stream": True,
         }
-        if use_tools:
+        if use_tools and iteration < max_tool_iterations:
             payload["tools"] = TOOL_DEFINITIONS
             payload["tool_choice"] = "auto"
 
         curr_text_chunks: list[str] = []
         curr_reasoning_chunks: list[str] = []
         tool_calls_accumulator: dict[int, dict[str, Any]] = {}
+        finish_reason = None
+        stream_done = False
 
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
@@ -266,11 +286,17 @@ async def run_openai_compat(
                             continue
                         data_str = line[5:].strip()
                         if data_str == "[DONE]":
+                            stream_done = True
                             break
                         try:
                             data = json.loads(data_str)
                         except Exception:
                             continue
+
+                        if data.get("error"):
+                            error = data["error"]
+                            message = error.get("message", str(error)) if isinstance(error, dict) else str(error)
+                            return OpenAICompatResult(text="", exit_code=1, stderr=f"Ошибка потока провайдера: {message}")
 
                         # Extract token usage if available
                         usage = data.get("usage")
@@ -284,6 +310,7 @@ async def run_openai_compat(
                         if not choices:
                             continue
                         choice0 = choices[0]
+                        finish_reason = choice0.get("finish_reason") or finish_reason
                         delta = choice0.get("delta") or choice0.get("message") or {}
 
                         # 1. Reasoning / Thinking delta (DeepSeek R1 / o1 / o3)
@@ -320,6 +347,15 @@ async def run_openai_compat(
 
         raw_assistant_text = "".join(curr_text_chunks)
         reasoning_text = "".join(curr_reasoning_chunks)
+        LOG.info("openai_compat iteration provider=%s iteration=%d text_len=%d tools=%d finish=%s done=%s",
+                 provider.id, iteration + 1, len(raw_assistant_text), len(tool_calls_accumulator),
+                 finish_reason, stream_done)
+        if stop_event and stop_event.is_set():
+            return OpenAICompatResult(text="🛑 Выполнение остановлено пользователем.", exit_code=130, stderr="User stopped execution.")
+        if not stream_done and not finish_reason:
+            return OpenAICompatResult(text="", exit_code=1, stderr="Поток ответа провайдера прервался до завершения.")
+        if finish_reason in ("length", "content_filter"):
+            return OpenAICompatResult(text="", exit_code=1, stderr=f"Ответ провайдера не завершён: {finish_reason}.")
 
         # Parse <think>...</think> if emitted inside content
         if "<think>" in raw_assistant_text and "</think>" in raw_assistant_text:
@@ -335,6 +371,8 @@ async def run_openai_compat(
 
         # If there are tool calls to execute
         if tool_calls_accumulator:
+            if iteration >= max_tool_iterations:
+                return OpenAICompatResult(text="", exit_code=1, stderr="Достигнут лимит вызовов инструментов; итоговый ответ не получен.")
             tool_calls_list = []
             for idx in sorted(tool_calls_accumulator.keys()):
                 item = tool_calls_accumulator[idx]
@@ -380,13 +418,16 @@ async def run_openai_compat(
                 })
 
             # Next iteration with tool results
+            if iteration + 1 == max_tool_iterations:
+                messages.append({"role": "user", "content": "Лимит инструментов достигнут. Дайте итоговый ответ на основе уже полученных данных и укажите, что не удалось проверить."})
             continue
 
         # No tool calls: final response reached!
         final_text = raw_assistant_text
         if not final_text.strip() and all_thoughts:
-            # Fallback if a reasoning model emitted all text inside reasoning_content / <think>
-            final_text = all_thoughts[-1]
+            final_text = f"💭 <i>(Ответ из блока размышлений)</i>\n\n{all_thoughts[-1]}"
+        elif not final_text.strip():
+            return OpenAICompatResult(text="", exit_code=1, stderr="Провайдер не вернул итоговый текст ответа.")
         break
 
     # If usage tokens weren't reported by provider, estimate roughly

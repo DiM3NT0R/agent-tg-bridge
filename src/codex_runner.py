@@ -396,6 +396,7 @@ async def run_codex(
             *args,
             cwd=chat_dir,
             env=env,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             limit=2 * 1024 * 1024,  # 2MB buffer
@@ -662,6 +663,14 @@ async def run_codex(
         elif stderr_out.strip():
             clean_err = re.sub(r"\x1b\[[0-9;]*[mK]", "", stderr_out).strip()
             err_text = f"⚠️ Ошибка Codex (код {process.returncode}):\n<code>{html.escape(clean_err[:1000])}</code>"
+        else:
+            tail_msg = (" ".join(message_chunks[-2:]) if message_chunks else "").strip()
+            if tail_msg:
+                err_text = f"⚠️ Codex завершился с ошибкой (код {process.returncode}):\n<code>{html.escape(tail_msg[:500])}</code>"
+                stderr_out = tail_msg
+            else:
+                err_text = f"⚠️ Codex завершился с ошибкой (код {process.returncode})."
+                stderr_out = f"Process exited with code {process.returncode} (empty stderr)"
 
     return CodexResult(
         text=err_text,

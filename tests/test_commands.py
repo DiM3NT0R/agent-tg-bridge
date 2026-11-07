@@ -127,10 +127,18 @@ async def test_callback_model_choice() -> None:
 async def test_callback_reset() -> None:
     cs = _state()
     cs.has_session = True
+    # 1. First click on R shows confirmation keyboard
     cq = CallbackQuery(update_id=1, callback_query_id="q", chat_id=42, user_id=42, message_id=1, data="R")
     reply = await handle_callback(cq, cs, _cfg())
+    assert cs.has_session is True
+    assert "подтверждение" in reply.toast.lower()
+    assert any("R:confirm" in btn["callback_data"] for row in reply.keyboard or [] for btn in row)
+
+    # 2. Confirm reset
+    cq_conf = CallbackQuery(update_id=2, callback_query_id="q2", chat_id=42, user_id=42, message_id=1, data="R:confirm")
+    reply_conf = await handle_callback(cq_conf, cs, _cfg())
     assert cs.has_session is False
-    assert "сброшена" in reply.toast.lower()
+    assert "сброшена" in reply_conf.toast.lower()
 
 
 async def test_callback_mode_choice() -> None:

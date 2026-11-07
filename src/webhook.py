@@ -19,10 +19,19 @@ WEBHOOK_PATH = "/webhook"
 def _verify_secret(body: bytes, header: str, token: str) -> bool:
     if not header or not token:
         return False
-    expected = hmac.new(
-        hashlib.sha256(token.encode()).digest(),
-        body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, header)
+    # Telegram sends the exact secret_token directly in the X-Telegram-Bot-Api-Secret-Token header
+    h_bytes = header.encode("utf-8") if isinstance(header, str) else bytes(header)
+    t_bytes = token.encode("utf-8") if isinstance(token, str) else bytes(token)
+    if hmac.compare_digest(h_bytes, t_bytes):
+        return True
+    # Legacy fallback: HMAC of body if token is used as secret key
+    try:
+        expected = hmac.new(
+            hashlib.sha256(t_bytes).digest(),
+            body, hashlib.sha256).hexdigest().encode("utf-8")
+        return hmac.compare_digest(expected, h_bytes)
+    except Exception:
+        return False
 
 
 async def webhook_handler(

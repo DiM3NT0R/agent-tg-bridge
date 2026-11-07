@@ -491,7 +491,7 @@ class TelegramClient:
         self._client: httpx.AsyncClient | None = None
 
     async def __aenter__(self) -> "TelegramClient":
-        self._client = httpx.AsyncClient(timeout=httpx.Timeout(35.0))
+        self._client = httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=15.0))
         return self
 
     async def __aexit__(self, *exc: object) -> None:
@@ -534,11 +534,15 @@ class TelegramClient:
 
     async def get_updates(self, offset: int, timeout: int = 30) -> list[dict[str, Any]]:
         assert self._client is not None
-        r = await self._client.get(f"{self._base}/getUpdates", params={
-            "offset": offset,
-            "timeout": timeout,
-            "allowed_updates": '["message","callback_query"]',
-        })
+        r = await self._client.get(
+            f"{self._base}/getUpdates",
+            params={
+                "offset": offset,
+                "timeout": timeout,
+                "allowed_updates": '["message","callback_query"]',
+            },
+            timeout=float(timeout + 20),
+        )
         data = r.json()
         if not data.get("ok"):
             raise RuntimeError(f"telegram getUpdates failed: {data.get('description')}")

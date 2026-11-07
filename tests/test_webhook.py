@@ -24,6 +24,9 @@ from src.webhook import (
 def test_verify_secret_valid() -> None:
     token = "secret123"
     body = json.dumps({"update_id": 1}).encode()
+    # Direct Telegram header matching secret_token
+    assert _verify_secret(body, token, token) is True
+    # HMAC signature
     sig = hmac.new(hashlib.sha256(token.encode()).digest(),
                    body, hashlib.sha256).hexdigest()
     assert _verify_secret(body, sig, token) is True

@@ -5,6 +5,7 @@ import asyncio
 import html
 import logging
 import os
+import re
 import secrets
 import signal
 import subprocess
@@ -45,10 +46,34 @@ DEFAULT_CONFIG_PATH = Path(__file__).parent.parent / "config.json"
 DEFAULT_STATE_PATH = Path.home() / ".antigravity" / "bridge" / "state.json"
 DEFAULT_CHATS_ROOT = Path.home() / ".antigravity" / "bridge" / "chats"
 DEFAULT_AGY_BIN = "agy"
-LONG_POLL_TIMEOUT = 30
+LONG_POLL_TIMEOUT = 25
 AGY_TIMEOUT_S = 1800.0  # 30 minutes
 AGY_INACTIVITY_TIMEOUT_S = 600.0  # 10 minutes without model response (outside active tools)
 _QUEUE = TurnQueue()
+
+_SECRET_PATTERN = re.compile(
+    r"(?i)\b(?:sk-[a-zA-Z0-9_\-]{8,}|gsk_[a-zA-Z0-9_\-]{8,}|bot[0-9]{8,}:[a-zA-Z0-9_\-]{30,}|cartesia_[a-zA-Z0-9_\-]{8,})"
+)
+
+
+class SecretMaskingFilter(logging.Filter):
+    """Filter out secret keys and bot tokens from all log outputs."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str):
+            record.msg = _SECRET_PATTERN.sub("[MASKED_KEY]", record.msg)
+        if record.args:
+            if isinstance(record.args, dict):
+                record.args = {
+                    k: (_SECRET_PATTERN.sub("[MASKED_KEY]", str(v)) if isinstance(v, str) else v)
+                    for k, v in record.args.items()
+                }
+            elif isinstance(record.args, tuple):
+                record.args = tuple(
+                    _SECRET_PATTERN.sub("[MASKED_KEY]", str(v)) if isinstance(v, str) else v
+                    for v in record.args
+                )
+        return True
 
 
 class _TelegramLike(Protocol):
@@ -562,7 +587,7 @@ async def _fetch_updates(tg: _TelegramLike, offset: int) -> list[dict[str, Any]]
     try:
         return await asyncio.wait_for(
             tg.get_updates(offset=offset, timeout=LONG_POLL_TIMEOUT),
-            timeout=LONG_POLL_TIMEOUT + 5,
+            timeout=LONG_POLL_TIMEOUT + 15,
         )
     except asyncio.TimeoutError:
         return []
@@ -574,8 +599,8 @@ async def _fetch_updates(tg: _TelegramLike, offset: int) -> list[dict[str, Any]]
         return []
 
 
-async def _accounts_keepalive_loop(stop_event: asyncio.Event, agy_path: str = "") -> None:
-    """Perpetually keep all saved Codex and Antigravity authorization tokens alive."""
+async def _accounts_keepalive_loop(stop_event: asyncio.Event, agy_path: str = "", chats_root: Path | None = None) -> None:
+    """Perpetually keep all saved Codex and Antigravity authorization tokens alive and purge expired inbox files."""
     # Short delay on startup (5s) so daemon initial polling connects first
     try:
         await asyncio.wait_for(stop_event.wait(), timeout=5.0)
@@ -600,6 +625,15 @@ async def _accounts_keepalive_loop(stop_event: asyncio.Event, agy_path: str = ""
         except Exception as exc:
             LOG.warning("Antigravity token keepalive error: %s", exc)
 
+        if chats_root is not None:
+            try:
+                from src.media import clean_all_inboxes
+                purged = clean_all_inboxes(chats_root, max_age_hours=24)
+                if purged > 0:
+                    LOG.info("Cleaned %d expired inbox file(s) across all chats", purged)
+            except Exception as exc:
+                LOG.debug("Error during periodic inbox cleanup: %s", exc)
+
         # Sleep for 2 hours or until stop_event is set
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=7200.0)
@@ -620,7 +654,7 @@ async def run(
     state = load_state(state_path, chats_root)
     tick = 0
     running_turn_tasks: set[asyncio.Task] = set()
-    keepalive_task = asyncio.create_task(_accounts_keepalive_loop(stop_event, agy_path=agy_path))
+    keepalive_task = asyncio.create_task(_accounts_keepalive_loop(stop_event, agy_path=agy_path, chats_root=chats_root))
     async with tg:
         while not stop_event.is_set():
             tick += 1
@@ -647,7 +681,22 @@ async def run(
             wh_updates = drain_webhook_updates()
             updates.extend(wh_updates)
             for upd in updates:
-                LOG.info("Received update: %s", upd)
+                LOG.debug("Received update raw: %s", upd)
+                upd_id = upd.get("update_id", 0)
+                if "message" in upd:
+                    m = upd["message"]
+                    c_id = m.get("chat", {}).get("id")
+                    u_id = m.get("from", {}).get("id")
+                    m_type = "text" if "text" in m else ("photo" if "photo" in m else "other")
+                    LOG.info("Received update id=%s (message type=%s chat=%s user=%s)", upd_id, m_type, c_id, u_id)
+                elif "callback_query" in upd:
+                    cq = upd["callback_query"]
+                    cq_data = str(cq.get("data") or "")
+                    if len(cq_data) > 30:
+                        cq_data = cq_data[:27] + "..."
+                    LOG.info("Received update id=%s (callback_query data=%s)", upd_id, cq_data)
+                else:
+                    LOG.info("Received update id=%s (keys=%s)", upd_id, list(upd.keys()))
                 state.last_update_id = max(state.last_update_id, int(upd.get("update_id", 0)))
 
                 msg = parse_update_for_daemon(upd)
@@ -734,6 +783,16 @@ async def run(
             done, pending = await asyncio.wait(running_turn_tasks, timeout=60.0)
             if pending:
                 LOG.warning("Cancelling %d remaining task(s) after shutdown timeout", len(pending))
+                # Notify any active turns that they were interrupted by restart
+                for (cid, tid) in list(ACTIVE_STOPS.keys()):
+                    try:
+                        await tg.send_message(
+                            cid,
+                            "🔄 <b>Сервис перезапускается.</b> Ход был прерван перезапуском, пожалуйста, повторите ваш запрос.",
+                            message_thread_id=tid if isinstance(tid, int) else None,
+                        )
+                    except Exception:
+                        pass
                 for pt in pending:
                     pt.cancel()
         save_state(state_path, state)
@@ -788,6 +847,12 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    mask_filter = SecretMaskingFilter()
+    root_log = logging.getLogger()
+    root_log.addFilter(mask_filter)
+    for h in root_log.handlers:
+        h.addFilter(mask_filter)
+
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 

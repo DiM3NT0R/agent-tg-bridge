@@ -314,3 +314,27 @@ def test_workspace_files_and_safe_resolve(tmp_path: Path) -> None:
     # Path traversal attack
     assert safe_resolve_workspace_file(str(tmp_path), "../etc/passwd") is None
     assert safe_resolve_workspace_file(str(tmp_path), "nonexistent.py") is None
+
+
+def test_clean_all_inboxes(tmp_path: Path) -> None:
+    import os
+    import time
+    from src.media import clean_all_inboxes
+
+    c1 = tmp_path / "chat_1" / ".bridge-inbox"
+    c2 = tmp_path / "chat_2" / ".bridge-inbox"
+    c1.mkdir(parents=True)
+    c2.mkdir(parents=True)
+    f1 = c1 / "old.jpg"
+    f2 = c2 / "new.jpg"
+    f1.write_bytes(b"old")
+    f2.write_bytes(b"new")
+
+    # Set mtime of f1 to 48 hours ago
+    old_time = time.time() - 48 * 3600
+    os.utime(f1, (old_time, old_time))
+
+    removed = clean_all_inboxes(tmp_path, max_age_hours=24)
+    assert removed == 1
+    assert not f1.exists()
+    assert f2.exists()

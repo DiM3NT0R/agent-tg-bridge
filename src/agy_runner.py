@@ -151,6 +151,7 @@ async def run_agy(
             *args,
             cwd=chat_dir,
             env=env,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             limit=2 * 1024 * 1024,  # 2MB

@@ -563,13 +563,16 @@ async def _render_auth_card() -> BridgeReply:
         for acc in saved_accs:
             marker = "● " if acc.is_active else "○ "
             state = " — <i>активен</i>" if acc.is_active else ""
-            lines.append(f"• {marker}<b>{html.escape(acc.label)}</b>{state}")
+            is_revoked = (acc.auth_data or {}).get("status") in ("revoked", "invalid")
+            revoked_str = " ⚠️ <i>(токен отозван)</i>" if is_revoked else ""
+            lines.append(f"• {marker}<b>{html.escape(acc.label)}</b>{state}{revoked_str}")
 
         # Account switch buttons row (2 buttons per row)
         row: list[dict[str, Any]] = []
         for acc in saved_accs:
             marker = "● " if acc.is_active else "○ "
-            lbl = acc.label
+            is_revoked = (acc.auth_data or {}).get("status") in ("revoked", "invalid")
+            lbl = f"⚠️ {acc.label}" if is_revoked else acc.label
             if len(lbl) > 18:
                 lbl = lbl[:16] + ".."
             row.append({"text": f"{marker}{lbl}", "callback_data": f"acc:switch:{acc.id}"})
@@ -2334,6 +2337,25 @@ async def handle_callback(
             return BridgeReply("Останавливаю...", toast="Запрос на остановку отправлен")
         return BridgeReply("Нет активной задачи", toast="Ничего не выполняется")
     if data == "R":
+        keyboard: InlineKeyboard = [
+            [
+                {"text": "⚠️ Да, сбросить сессию", "callback_data": "R:confirm"},
+                {"text": "❌ Отмена", "callback_data": "nav:settings"},
+            ]
+        ]
+        return BridgeReply(
+            text=(
+                "🧹 <b>Сброс контекста сессии</b>\n\n"
+                "Вы действительно хотите сбросить текущую сессию?\n"
+                "• История диалога со всеми движками (AGY, Codex, API) будет очищена.\n"
+                "• Следующее сообщение начнет чистый диалог.\n\n"
+                "<i>Подтвердите действие:</i>"
+            ),
+            keyboard=keyboard,
+            toast="Требуется подтверждение",
+        )
+
+    if data == "R:confirm":
         from src.context_compactor import clear_chat_history
         cs.has_session = False
         cs.conversation_id = ""

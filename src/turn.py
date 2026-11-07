@@ -498,6 +498,8 @@ async def execute_codex(
         )
 
     clean_text = clean_system_messages(result.text or "")
+    if result.exit_code == 0 and not clean_text.strip():
+        return "⚠️ Codex не вернул текст ответа. Попробуйте повторить запрос.", 1
     if result.exit_code == 0:
         thinking_mode = getattr(cs, "thinking", "live")
         if thinking_mode == "all" and result.thoughts:
@@ -610,6 +612,8 @@ async def execute_openai_compat(
     )
 
     clean_text = clean_system_messages(result.text or "")
+    if result.exit_code == 0 and not clean_text.strip():
+        return f"⚠️ {html.escape(provider.name)} не вернул текст ответа. Попробуйте повторить запрос.", 1
     if result.exit_code == 0:
         thinking_mode = getattr(cs, "thinking", "live")
         if thinking_mode == "all" and result.thoughts:
@@ -697,6 +701,7 @@ INVALID_MODEL_EXPLANATION_MSG = (
 
 # Retry policy: 15 attempts total. First 3 attempts are instant (0s),
 # then remaining attempts wait a short delay (1.5s) to avoid burning all attempts on a brief network blip.
+# If agy is killed by SIGKILL (-9 / OOM), _is_retryable_failure immediately stops retrying.
 _INSTANT_RETRIES = 3
 _MAX_RETRIES = 15
 _RETRY_DELAY_S = 1.5
@@ -797,6 +802,10 @@ def _is_retryable_failure(result: "AgyResult") -> bool:
         return False
     # User cancellation (130) or hard timeout (124) — do not retry.
     if result.exit_code in (130, 124):
+        return False
+    # Process killed with SIGKILL (-9) is usually an OOM kill. Do not spin retries.
+    if result.exit_code == -9:
+        LOG.error("agy exited with SIGKILL (-9), likely killed by OOM killer or external process.")
         return False
     # Permanent hard quota, location, or invalid model failures — do not retry.
     if _is_hard_quota_error(result) or _is_location_error(result) or _is_invalid_model_error(result):

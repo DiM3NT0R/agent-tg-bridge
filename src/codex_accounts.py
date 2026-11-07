@@ -418,6 +418,14 @@ async def refresh_account_tokens(
                 except Exception:
                     err_code = resp.status_code
                     err_msg = resp.text
+
+                err_str = f"{err_code}: {err_msg}".lower()
+                if "invalid_grant" in err_str or "invalidated" in err_str or resp.status_code in (400, 401):
+                    acc.auth_data["status"] = "revoked"
+                    acc.auth_data["error"] = str(err_msg)
+                    adir = get_accounts_dir(accounts_dir)
+                    _write_account_file(acc, adir)
+
                 return False, f"Ошибка обновления ({err_code}): {err_msg}", None
     except Exception as exc:
         return False, f"Ошибка сети при обновлении токена: {exc}", None
