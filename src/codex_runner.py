@@ -18,7 +18,9 @@ import os
 import re
 import shutil
 import signal
+from pathlib import Path
 from dataclasses import dataclass
+from contextlib import asynccontextmanager
 from typing import Awaitable, Callable
 
 LOG = logging.getLogger("antigravity_telegram_bridge")
@@ -26,6 +28,37 @@ LOG = logging.getLogger("antigravity_telegram_bridge")
 _STDOUT_CAP_BYTES = 524_288  # 512 KiB
 DEFAULT_OVERALL_TIMEOUT_S = 1800.0  # 30 minutes
 DEFAULT_INACTIVITY_TIMEOUT_S = 600.0  # 10 minutes without model/system response
+_codex_condition = asyncio.Condition()
+_codex_active = 0
+_codex_updating = False
+
+
+@asynccontextmanager
+async def codex_turn_guard():
+    global _codex_active
+    async with _codex_condition:
+        await _codex_condition.wait_for(lambda: not _codex_updating)
+        _codex_active += 1
+    try:
+        yield
+    finally:
+        async with _codex_condition:
+            _codex_active -= 1
+            _codex_condition.notify_all()
+
+
+@asynccontextmanager
+async def codex_update_guard():
+    global _codex_updating
+    async with _codex_condition:
+        await _codex_condition.wait_for(lambda: not _codex_updating and _codex_active == 0)
+        _codex_updating = True
+    try:
+        yield
+    finally:
+        async with _codex_condition:
+            _codex_updating = False
+            _codex_condition.notify_all()
 
 
 @dataclass(frozen=True)
@@ -148,7 +181,7 @@ async def install_codex() -> tuple[bool, str]:
     LOG.info("Installing @openai/codex via %s...", npm_bin)
     try:
         proc = await asyncio.create_subprocess_exec(
-            npm_bin, "install", "-g", "@openai/codex",
+            npm_bin, "install", "-g", "@openai/codex@latest",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -158,7 +191,7 @@ async def install_codex() -> tuple[bool, str]:
         return False, f"Ошибка запуска npm: {e}"
 
     found = find_codex_bin()
-    if found:
+    if proc.returncode == 0 and found:
         if found != "/usr/local/bin/codex" and not os.path.exists("/usr/local/bin/codex"):
             try:
                 os.symlink(found, "/usr/local/bin/codex")
@@ -170,18 +203,101 @@ async def install_codex() -> tuple[bool, str]:
     npm_global = os.path.expanduser("~/.npm-global")
     try:
         proc2 = await asyncio.create_subprocess_exec(
-            npm_bin, "install", "-g", "--prefix", npm_global, "@openai/codex",
+            npm_bin, "install", "-g", "--prefix", npm_global, "@openai/codex@latest",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         await proc2.communicate()
         found = find_codex_bin()
-        if found:
+        if proc2.returncode == 0 and found:
             return True, f"Codex CLI успешно установлен: {found}"
     except Exception as e:
         LOG.warning("npm prefix fallback failed: %s", e)
 
     return False, f"Установка @openai/codex не удалась (код {proc.returncode}):\n{out[-300:]}"
+
+
+def _npm_codex_prefix(binary: str) -> str | None:
+    """Identify the npm prefix owning the selected executable, without changing other installs."""
+    path = Path(binary).resolve()
+    for parent in path.parents:
+        if parent.name != "codex" or parent.parent.name != "@openai":
+            continue
+        if parent.parent.parent.name != "node_modules" or parent.parent.parent.parent.name != "lib":
+            continue
+        try:
+            package = json.loads((parent / "package.json").read_text(encoding="utf-8"))
+            if package.get("name") == "@openai/codex":
+                return str(parent.parent.parent.parent.parent)
+        except (OSError, ValueError):
+            return None
+    return None
+
+
+async def _codex_update_command(*args: str, timeout: float = 120) -> tuple[int, str]:
+    proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        proc.kill()
+        await proc.communicate()
+        raise
+    output = stdout if proc.returncode == 0 else stdout + b"\n" + stderr
+    return proc.returncode, output.decode("utf-8", errors="replace").strip()
+
+
+async def update_npm_codex() -> tuple[bool, str]:
+    """Update only the npm package that owns the CLI selected by the bridge."""
+    binary = find_codex_bin("/usr/local/bin/codex")
+    npm = shutil.which("npm")
+    if not binary or not npm:
+        return False, "Codex CLI или npm не найден"
+    prefix = _npm_codex_prefix(binary)
+    if not prefix:
+        return False, f"Codex CLI {binary} не является npm-установкой; автообновление пропущено"
+    try:
+        rc, installed = await _codex_update_command(binary, "--version", timeout=10)
+        view_rc, latest = await _codex_update_command(npm, "view", "@openai/codex@latest", "version", timeout=30)
+        installed_match = re.search(r"\b(\d+)\.(\d+)\.(\d+)\b", installed)
+        latest_match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", latest)
+        if rc or view_rc or not installed_match or not latest_match:
+            return False, "Не удалось определить установленную или последнюю версию Codex CLI"
+        if tuple(map(int, installed_match.groups())) >= tuple(map(int, latest_match.groups())):
+            return False, f"Codex CLI уже актуален: {installed_match.group(0)}"
+        rc, output = await _codex_update_command(npm, "install", "-g", "--prefix", prefix, "@openai/codex@latest")
+        if rc:
+            return False, f"Обновление Codex CLI не удалось: {output[-300:]}"
+        rc, updated = await _codex_update_command(binary, "--version", timeout=10)
+        match = re.search(r"\b(\d+)\.(\d+)\.(\d+)\b", updated)
+        if rc or not match or tuple(map(int, match.groups())) < tuple(map(int, latest_match.groups())):
+            return False, "npm завершился, но используемый мостом Codex CLI не обновился"
+        from src import models
+        models._cached_codex_models = None
+        models._cached_codex_at = 0.0
+        return True, f"Codex CLI обновлён: {installed_match.group(0)} → {match.group(0)}"
+    except (OSError, asyncio.TimeoutError) as exc:
+        return False, f"Не удалось проверить или обновить Codex CLI: {exc}"
+
+
+async def codex_auto_update_loop(stop: asyncio.Event, *, is_busy: Callable[[], bool], interval_s: float = 86400, initial_delay_s: float = 10) -> None:
+    """Check on startup and daily; do not run npm during a Codex turn."""
+    delay = initial_delay_s
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=delay)
+            return
+        except asyncio.TimeoutError:
+            pass
+        if is_busy():
+            delay = 60
+            continue
+        async with codex_update_guard():
+            if is_busy():
+                delay = 60
+                continue
+            updated, message = await update_npm_codex()
+            LOG.info("Codex auto-update: %s", message)
+        delay = interval_s
 
 
 def _build_codex_args(

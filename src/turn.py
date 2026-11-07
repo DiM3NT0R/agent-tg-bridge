@@ -654,7 +654,9 @@ async def execute_turn(
     if target_engine in ("openai", "openai_compat"):
         reply_text, exit_code = await execute_openai_compat(tg, chat_id, prompt_for_engine, msg, cs, cfg)
     elif target_engine == "codex":
-        reply_text, exit_code = await execute_codex(tg, chat_id, prompt_for_engine, msg, cs, cfg, codex_path)
+        from src.codex_runner import codex_turn_guard
+        async with codex_turn_guard():
+            reply_text, exit_code = await execute_codex(tg, chat_id, prompt_for_engine, msg, cs, cfg, codex_path)
     else:
         reply_text, exit_code = await _execute_agy_internal(tg, chat_id, prompt_for_engine, msg, cs, cfg, agy_path)
 

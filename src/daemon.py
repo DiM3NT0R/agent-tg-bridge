@@ -15,6 +15,7 @@ from typing import Any, Awaitable, Callable, Protocol
 
 from src.agy_runner import AgyResult, clean_system_messages
 from src.commands import BridgeReply, handle_callback, handle_text_command
+from src.codex_runner import codex_auto_update_loop
 from src.config import Config, load_config
 from src.health import memory_healthy, record_error, record_turn, start_server
 from src.media import build_media_prompt, clean_inbox
@@ -806,6 +807,7 @@ def main() -> None:
 
         wh_task: asyncio.Task | None = None
         upd_task: asyncio.Task | None = None
+        codex_upd_task: asyncio.Task | None = None
         wh_secret = ""
         wh_url = os.environ.get("CTI_WEBHOOK_URL", "")
         wh_port = int(os.environ.get("CTI_WEBHOOK_PORT") or "8080")
@@ -839,12 +841,21 @@ def main() -> None:
                     is_busy=lambda: _QUEUE.active or bool(_QUEUE.pending) or bool(ACTIVE_STOPS),
                 )
             )
+            codex_upd_task = asyncio.create_task(
+                codex_auto_update_loop(stop, is_busy=lambda: _QUEUE.active or bool(_QUEUE.pending) or bool(ACTIVE_STOPS))
+            )
 
             await run(
                 cfg=cfg, state_path=state_path, chats_root=chats_root,
                 tg=tg, agy_path=agy_path, info=info, stop_event=stop,
             )
         finally:
+            if codex_upd_task is not None:
+                codex_upd_task.cancel()
+                try:
+                    await codex_upd_task
+                except asyncio.CancelledError:
+                    pass
             if upd_task is not None:
                 upd_task.cancel()
                 try:

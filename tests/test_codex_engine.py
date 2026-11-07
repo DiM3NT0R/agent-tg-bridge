@@ -283,6 +283,71 @@ async def test_install_codex_npm_success(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_update_npm_codex_updates_selected_install_and_invalidates_catalog(tmp_path, monkeypatch):
+    import json
+    from src import codex_runner, models
+
+    package = tmp_path / "lib/node_modules/@openai/codex"
+    package.mkdir(parents=True)
+    (package / "package.json").write_text(json.dumps({"name": "@openai/codex"}))
+    script = package / "codex.js"
+    script.touch()
+    binary = tmp_path / "bin/codex"
+    binary.parent.mkdir()
+    binary.symlink_to(script)
+    monkeypatch.setattr(codex_runner, "find_codex_bin", lambda *_: str(binary))
+    monkeypatch.setattr(codex_runner.shutil, "which", lambda *_: "/usr/bin/npm")
+    command = AsyncMock(side_effect=[(0, "codex-cli 0.147.0"), (0, "0.166.0"), (0, "changed"), (0, "codex-cli 0.166.0")])
+    monkeypatch.setattr(codex_runner, "_codex_update_command", command)
+    monkeypatch.setattr(models, "_cached_codex_models", [("old", "old")])
+    ok, _ = await codex_runner.update_npm_codex()
+    assert ok
+    assert command.await_args_list[2].args == ("/usr/bin/npm", "install", "-g", "--prefix", str(tmp_path), "@openai/codex@latest")
+    assert models._cached_codex_models is None
+
+
+@pytest.mark.asyncio
+async def test_update_npm_codex_does_not_replace_unmanaged_install(tmp_path, monkeypatch):
+    from src import codex_runner
+    binary = tmp_path / "codex"
+    binary.touch()
+    monkeypatch.setattr(codex_runner, "find_codex_bin", lambda *_: str(binary))
+    monkeypatch.setattr(codex_runner.shutil, "which", lambda *_: "/usr/bin/npm")
+    command = AsyncMock()
+    monkeypatch.setattr(codex_runner, "_codex_update_command", command)
+    ok, message = await codex_runner.update_npm_codex()
+    assert not ok and "не является npm-установкой" in message
+    command.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_codex_updates_wait_for_turns_and_block_new_turns():
+    from src.codex_runner import codex_turn_guard, codex_update_guard
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def update():
+        async with codex_update_guard():
+            entered.set()
+            await release.wait()
+
+    async with codex_turn_guard():
+        task = asyncio.create_task(update())
+        await asyncio.sleep(0)
+        assert not entered.is_set()
+    await entered.wait()
+    async def turn():
+        async with codex_turn_guard():
+            return True
+    turn_task = asyncio.create_task(turn())
+    await asyncio.sleep(0)
+    assert not turn_task.done()
+    release.set()
+    await task
+    assert await turn_task
+
+
+@pytest.mark.asyncio
 async def test_check_codex_auth_not_installed(monkeypatch):
     monkeypatch.setattr("src.codex_runner.find_codex_bin", lambda *_: None)
     monkeypatch.setattr("os.path.exists", lambda p: False)
