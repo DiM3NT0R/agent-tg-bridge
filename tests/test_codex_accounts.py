@@ -216,6 +216,42 @@ async def test_commands_codex_account_card(fake_env, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_delete_active_account_keeps_remaining_account_visible_and_selectable(fake_env, monkeypatch):
+    codex_home, accounts_dir, auth_file = fake_env
+    monkeypatch.setattr("src.codex_accounts.get_accounts_dir", lambda *_: accounts_dir)
+    monkeypatch.setattr("src.codex_accounts.get_active_auth_path", lambda *_: auth_file)
+    monkeypatch.setattr("src.codex_runner.check_codex_auth", AsyncMock(return_value=(False, "Not logged in")))
+    monkeypatch.setattr("src.codex_accounts.is_token_stale", lambda *_: False)
+    first = {"auth_mode": "chatgpt", "tokens": {"id_token": _make_dummy_jwt({"email": "first@test.com"})}}
+    second = {"auth_mode": "chatgpt", "tokens": {"id_token": _make_dummy_jwt({"email": "second@test.com"})}}
+    active = save_account_data(first, accounts_dir=accounts_dir, auth_path=auth_file)
+    remaining = save_account_data(second, accounts_dir=accounts_dir, auth_path=auth_file, make_active=False)
+    cs, cfg = ChatState(chat_dir=str(codex_home)), _dummy_cfg()
+    callback = lambda data: CallbackQuery(update_id=1, callback_query_id="c", user_id=42, chat_id=100, message_id=20, data=data)
+
+    reply = await handle_callback(callback(f"acc:delete:{active.id}"), cs, cfg)
+    assert not auth_file.exists()
+    assert (accounts_dir / f"{remaining.id}.json").exists()
+    assert "second@test.com" in reply.text
+    buttons = [button for row in reply.keyboard for button in row]
+    assert any(button.get("callback_data") == f"acc:switch:{remaining.id}" for button in buttons)
+    assert any(button.get("callback_data") == "acc:del_menu" for button in buttons)
+    await handle_callback(callback(f"acc:switch:{remaining.id}"), cs, cfg)
+    assert parse_auth_data(read_active_auth_data(auth_file))["email"] == "second@test.com"
+
+
+def test_delete_inactive_account_preserves_active_credentials(fake_env):
+    _, accounts_dir, auth_file = fake_env
+    first = {"auth_mode": "chatgpt", "tokens": {"id_token": _make_dummy_jwt({"email": "first@test.com"})}}
+    second = {"auth_mode": "chatgpt", "tokens": {"id_token": _make_dummy_jwt({"email": "second@test.com"})}}
+    active = save_account_data(first, accounts_dir=accounts_dir, auth_path=auth_file)
+    other = save_account_data(second, accounts_dir=accounts_dir, auth_path=auth_file, make_active=False)
+    assert remove_account(other.id, accounts_dir=accounts_dir, auth_path=auth_file)[0]
+    assert read_active_auth_data(auth_file) == first
+    assert (accounts_dir / f"{active.id}.json").exists()
+
+
+@pytest.mark.asyncio
 async def test_commands_codex_key_set(fake_env, monkeypatch):
     codex_home, accounts_dir, auth_file = fake_env
     monkeypatch.setattr("src.codex_accounts.get_accounts_dir", lambda *_: accounts_dir)

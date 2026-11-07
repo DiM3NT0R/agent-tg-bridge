@@ -557,8 +557,8 @@ async def _render_auth_card() -> BridgeReply:
 
     keyboard: InlineKeyboard = []
 
-    # If there are multiple saved accounts, show fast switcher buttons
-    if len(saved_accs) > 1:
+    # A single saved account must remain visible and selectable after logout or deletion.
+    if saved_accs:
         lines.append(f"\n📁 <b>Сохраненные аккаунты Codex ({len(saved_accs)}):</b>")
         for acc in saved_accs:
             marker = "● " if acc.is_active else "○ "
@@ -593,7 +593,7 @@ async def _render_auth_card() -> BridgeReply:
     manage_row: list[dict[str, Any]] = []
     if len(saved_accs) > 0:
         manage_row.append({"text": "🔄 Продлить сессии", "callback_data": "acc:refresh_all"})
-    if len(saved_accs) > 1:
+    if saved_accs:
         manage_row.append({"text": "🗑 Удалить", "callback_data": "acc:del_menu"})
     if codex_ok:
         manage_row.append({"text": "🚪 Выйти", "callback_data": "acc:logout"})
