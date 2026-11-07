@@ -436,5 +436,51 @@ async def test_slash_model_add_and_del(tmp_path: Path, monkeypatch: pytest.Monke
     assert "удалена" in del_rep.text
 
 
+async def test_model_selection_preserves_section_engine_over_overlapping_provider(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clicking an AGY or Codex model button must set cs.engine to 'agy'/'codex' even if CheapAI has the same model ID."""
+    from src.openai_providers import OpenAIProvider, save_provider
+
+    prov_path = tmp_path / "providers.json"
+    monkeypatch.setattr("src.openai_providers._DEFAULT_STORAGE_PATH", prov_path)
+    save_provider(
+        OpenAIProvider(
+            id="cheapai",
+            name="CheapAI",
+            base_url="https://api.cheapai.io/v1",
+            api_key="sk-test",
+            default_model="gemini-3.8-flash",
+            models=["gemini-3.8-flash", "gpt-6.1-sol"],
+        ),
+        make_active=True,
+        storage_path=prov_path,
+    )
+
+    cs = _state()
+    cfg = _cfg()
+
+    # 1. Click AGY section button m:agy:gemini-3.8-flash
+    cq_agy = CallbackQuery(update_id=20, callback_query_id="q20", chat_id=42, user_id=42, message_id=1, data="m:agy:gemini-3.8-flash")
+    rep_agy = await handle_callback(cq_agy, cs, cfg)
+    assert cs.model == "gemini-3.8-flash"
+    assert cs.engine == "agy"
+    assert "Reasoning Effort" in rep_agy.text
+    assert "Gemini / Antigravity" in rep_agy.text
+
+    # 2. Click OpenAI section button m:openai:gemini-3.8-flash
+    cq_oai = CallbackQuery(update_id=21, callback_query_id="q21", chat_id=42, user_id=42, message_id=1, data="m:openai:gemini-3.8-flash")
+    rep_oai = await handle_callback(cq_oai, cs, cfg)
+    assert cs.model == "gemini-3.8-flash"
+    assert cs.engine == "openai"
+    assert "OPENAI" in rep_oai.toast
+
+    # 3. Click Codex section button m:codex:gpt-6.1-sol
+    cq_cdx = CallbackQuery(update_id=22, callback_query_id="q22", chat_id=42, user_id=42, message_id=1, data="m:codex:gpt-6.1-sol")
+    rep_cdx = await handle_callback(cq_cdx, cs, cfg)
+    assert cs.model == "gpt-6.1-sol"
+    assert cs.engine == "codex"
+    assert "Reasoning Effort" in rep_cdx.text
+    assert "Codex" in rep_cdx.text
+
+
 
 

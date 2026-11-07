@@ -256,7 +256,7 @@ def _render_voice_picker(cs: "ChatState", cfg: "Config") -> BridgeReply:
     return BridgeReply(text=text, keyboard=_voice_keyboard(cs.voice, cs.voice_speed, cs.auto_voice))
 
 
-def _model_keyboard(current_per_chat: str) -> InlineKeyboard:
+def _model_keyboard(current_per_chat: str, current_engine: str = "") -> InlineKeyboard:
     from src.models import strip_model_effort
     from src.models_config import get_active_models_for_picker
 
@@ -266,30 +266,34 @@ def _model_keyboard(current_per_chat: str) -> InlineKeyboard:
     rows: InlineKeyboard = []
 
     current_base = strip_model_effort(current_per_chat)[0] if current_per_chat else ""
+    eff_engine = current_engine or (get_engine_for_model(current_per_chat) if current_per_chat else "")
 
     # Section 1: Google Antigravity / Gemini
     if agy_models:
         rows.append([{"text": "── 🌐 Antigravity / Gemini ──", "callback_data": "noop"}])
         for model_id, display_name in agy_models:
-            marker = "● " if (model_id == current_per_chat or model_id == current_base) else "○ "
+            is_match = (model_id == current_per_chat or model_id == current_base) and (not eff_engine or eff_engine == "agy")
+            marker = "● " if is_match else "○ "
             label = f"{marker}{display_name}" if display_name and display_name != model_id else f"{marker}{model_id}"
-            rows.append([{"text": label, "callback_data": f"m:{model_id}"}])
+            rows.append([{"text": label, "callback_data": f"m:agy:{model_id}"}])
 
     # Section 2: OpenAI Codex
     if codex_models:
         rows.append([{"text": "── ⚡️ OpenAI Codex ──", "callback_data": "noop"}])
         for model_id, display_name in codex_models:
-            marker = "● " if (model_id == current_per_chat or model_id == current_base) else "○ "
+            is_match = (model_id == current_per_chat or model_id == current_base) and (not eff_engine or eff_engine == "codex")
+            marker = "● " if is_match else "○ "
             label = f"{marker}{display_name}" if display_name and display_name != model_id else f"{marker}{model_id}"
-            rows.append([{"text": label, "callback_data": f"m:{model_id}"}])
+            rows.append([{"text": label, "callback_data": f"m:codex:{model_id}"}])
 
-    # Section 3: OpenAI-Compatible / Custom Provider (CheapAI, OpenRouter, DeepSeek, etc.)
+    # Section 3: OpenAI-Compatible / Custom Provider (OpenRouter, DeepSeek, etc.)
     if openai_models:
         rows.append([{"text": "── 🌐 OpenAI-Compatible API ──", "callback_data": "noop"}])
         for model_id, display_name in openai_models[:12]:
-            marker = "● " if (model_id == current_per_chat or model_id == current_base) else "○ "
+            is_match = (model_id == current_per_chat or model_id == current_base) and (not eff_engine or eff_engine in ("openai", "openai_compat"))
+            marker = "● " if is_match else "○ "
             label = f"{marker}{display_name}" if display_name and display_name != model_id else f"{marker}{model_id}"
-            rows.append([{"text": label, "callback_data": f"m:{model_id}"}])
+            rows.append([{"text": label, "callback_data": f"m:openai:{model_id}"}])
 
     default_marker = "● " if not current_per_chat else "○ "
     rows.append([
@@ -354,8 +358,8 @@ def _render_effort_picker(cs: "ChatState", cfg: "Config") -> BridgeReply:
 
 
 def _render_model_effort_picker(model_id: str, cs: "ChatState", cfg: "Config") -> BridgeReply:
-    engine = get_engine_for_model(model_id)
-    eng_name = "Codex" if engine == "codex" else ("OpenAI" if engine == "openai" else "Gemini / Antigravity")
+    engine = getattr(cs, "engine", "") or get_engine_for_model(model_id)
+    eng_name = "Codex" if engine == "codex" else ("OpenAI" if engine in ("openai", "openai_compat") else "Gemini / Antigravity")
     text = (
         f"🤖 <b>Выбрана модель:</b> <code>{html.escape(model_id)}</code> ({eng_name})\n\n"
         f"⚙️ <b>Теперь выберите уровень Reasoning Effort (мышления) для этой модели:</b>\n"
@@ -459,7 +463,7 @@ def _render_model_picker(cs: "ChatState", cfg: "Config") -> BridgeReply:
     engine = getattr(cs, "engine", "") or get_engine_for_model(cur)
     return BridgeReply(
         text=f"🤖 <b>Выбор модели</b>\n\nТекущая: <code>{html.escape(cur)}</code> [{src}]\nДвижок: <b>{engine.upper()}</b>",
-        keyboard=_model_keyboard(cs.model),
+        keyboard=_model_keyboard(cs.model, getattr(cs, "engine", "")),
     )
 
 
@@ -1757,10 +1761,12 @@ async def handle_text_command(
         marker.touch()
         return BridgeReply("🔄 Перезапускаю мост... Служба плавно перезагрузится через 1-2 секунды.")
     if cmd in ("/reset", "/new", "/clear"):
+        from src.context_compactor import clear_chat_history
         cs.has_session = False
         cs.conversation_id = ""
         cs.codex_thread_id = ""
-        return BridgeReply("🧹 Сессия сброшена для обоих движков (AGY и Codex). Следующее сообщение начнет чистую сессию.")
+        clear_chat_history(cs.chat_dir)
+        return BridgeReply("🧹 Сессия сброшена для всех движков (AGY, Codex, API). Следующее сообщение начнет чистую сессию.")
     if cmd == "/stop":
         import src.turn
         if src.turn.request_stop(
@@ -2226,8 +2232,8 @@ async def handle_callback(
         lines = [f"🤖 <b>Выберите модель {html.escape(p.name)}:</b>"]
         rows: InlineKeyboard = []
         for m in models[:12]:
-            marker = "● " if m == cs.model else "○ "
-            rows.append([{"text": f"{marker}{m}", "callback_data": f"m:{m}"}])
+            marker = "● " if (m == cs.model and getattr(cs, "engine", "") in ("openai", "openai_compat")) else "○ "
+            rows.append([{"text": f"{marker}{m}", "callback_data": f"m:openai:{m}"}])
         rows.append([{"text": "← К провайдерам", "callback_data": "nav:providers"}])
         return BridgeReply(text="\n".join(lines), keyboard=rows)
     if data == "nav:model":
@@ -2264,8 +2270,8 @@ async def handle_callback(
             toast = ""
             if 0 <= idx < len(page_items):
                 target_mid = page_items[idx][0]
-                is_on = toggle_model_visibility(target_mid)
-                toast = f"✅ {target_mid} включена" if is_on else f"❌ {target_mid} скрыта"
+                is_on = toggle_model_visibility(target_mid, provider=prov)
+                toast = f"✅ {target_mid} включена ({prov.upper()})" if is_on else f"❌ {target_mid} скрыта ({prov.upper()})"
             rep = _render_models_config_card(prov, page)
             return BridgeReply(text=rep.text, keyboard=rep.keyboard, toast=toast)
 
@@ -2327,9 +2333,11 @@ async def handle_callback(
             return BridgeReply("Останавливаю...", toast="Запрос на остановку отправлен")
         return BridgeReply("Нет активной задачи", toast="Ничего не выполняется")
     if data == "R":
+        from src.context_compactor import clear_chat_history
         cs.has_session = False
         cs.conversation_id = ""
         cs.codex_thread_id = ""
+        clear_chat_history(cs.chat_dir)
         rep = _render_settings(cs, cfg)
         return BridgeReply(text=rep.text, keyboard=rep.keyboard, toast="Сессия сброшена")
         
@@ -2341,7 +2349,15 @@ async def handle_callback(
         return BridgeReply(text=rep.text, keyboard=rep.keyboard, toast="Диалог выбран")
 
     if data.startswith("m:"):
-        choice = data[2:]
+        raw_choice = data[2:]
+        explicit_engine = ""
+        choice = raw_choice
+        for eng_prefix in ("agy:", "codex:", "openai:"):
+            if raw_choice.startswith(eng_prefix):
+                explicit_engine = eng_prefix[:-1]
+                choice = raw_choice[len(eng_prefix):]
+                break
+
         if choice == _DEFAULT_TOKEN:
             cs.model = ""
             cs.engine = ""
@@ -2350,7 +2366,7 @@ async def handle_callback(
             return BridgeReply(text=rep.text, keyboard=rep.keyboard, toast=toast)
         elif is_valid_model(choice):
             cs.model = choice
-            cs.engine = get_engine_for_model(choice)
+            cs.engine = explicit_engine or get_engine_for_model(choice)
             if cs.engine in ("agy", "codex"):
                 return _render_model_effort_picker(choice, cs, cfg)
             toast = f"Модель: {choice} ({cs.engine.upper()})"
@@ -2415,10 +2431,12 @@ async def handle_callback(
         return BridgeReply(text=rep.text, keyboard=rep.keyboard, toast=toast)
 
     if data == "do_compact":
+        from src.context_compactor import clear_chat_history
         cs.has_session = False
         cs.conversation_id = ""
         cs.codex_thread_id = ""
         cs.turn_count = 0
+        clear_chat_history(cs.chat_dir)
         kb: InlineKeyboard = [
             [{"text": "📁 Диалоги", "callback_data": "nav:projects"}],
             [{"text": "⚙️ Настройки", "callback_data": "nav:settings"}],

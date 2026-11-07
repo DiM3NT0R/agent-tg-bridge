@@ -567,17 +567,25 @@ async def execute_openai_compat(
     turn_start = time.perf_counter()
 
     try:
+        from src.context_compactor import get_openai_history_messages
+        history_msgs = get_openai_history_messages(
+            cs.chat_dir,
+            conversation_id=getattr(cs, "conversation_id", ""),
+        )
         timeout_s = parse_timeout_seconds(cs.print_timeout, default=AGY_TIMEOUT_S)
         result = await run_openai_compat(
             prompt,
             chat_dir=cs.chat_dir,
             provider=provider,
             model=cs.model or provider.default_model,
+            history_messages=history_msgs,
             timeout=timeout_s,
             on_thought=handle_thought,
             on_tool=handle_tool,
             stop_event=stop_event,
         )
+        if result.exit_code == 0:
+            cs.has_session = True
     finally:
         if ACTIVE_STOPS.get(key) is active_run:
             ACTIVE_STOPS.pop(key, None)
@@ -632,7 +640,7 @@ async def execute_turn(
 ) -> tuple[str, int]:
     """Execute a turn with the appropriate engine (agy, codex, or openai), applying token handoff."""
     from src.models import get_engine_for_model
-    from src.context_compactor import prepare_turn_prompt
+    from src.context_compactor import prepare_turn_prompt, append_chat_history
 
     effective_model = cs.model or cfg.agy.model
     target_engine = get_engine_for_model(effective_model)
@@ -644,11 +652,22 @@ async def execute_turn(
     cs.engine = target_engine
 
     if target_engine in ("openai", "openai_compat"):
-        return await execute_openai_compat(tg, chat_id, prompt_for_engine, msg, cs, cfg)
+        reply_text, exit_code = await execute_openai_compat(tg, chat_id, prompt_for_engine, msg, cs, cfg)
     elif target_engine == "codex":
-        return await execute_codex(tg, chat_id, prompt_for_engine, msg, cs, cfg, codex_path)
+        reply_text, exit_code = await execute_codex(tg, chat_id, prompt_for_engine, msg, cs, cfg, codex_path)
     else:
-        return await _execute_agy_internal(tg, chat_id, prompt_for_engine, msg, cs, cfg, agy_path)
+        reply_text, exit_code = await _execute_agy_internal(tg, chat_id, prompt_for_engine, msg, cs, cfg, agy_path)
+
+    if exit_code == 0 and reply_text:
+        append_chat_history(
+            chat_dir=cs.chat_dir,
+            user_prompt=prompt,
+            assistant_reply=reply_text,
+            engine=target_engine,
+            model=effective_model,
+        )
+
+    return reply_text, exit_code
 
 
 # Backward compatibility alias

@@ -272,32 +272,62 @@ def get_engine_for_model(model: str) -> str:
     """Return 'codex', 'openai', or 'agy' depending on the model name."""
     if not model:
         return "agy"
-    m = model.lower()
+    m = model.strip().lower()
+    if m.startswith(("agy:", "codex:", "openai:")):
+        prefix, _, _ = m.partition(":")
+        return prefix
     if m.startswith(("openai/", "cheapai/", "ceapai/", "openrouter/", "deepseek/")):
         return "openai"
-    try:
-        from src.openai_providers import get_active_provider
-        prov = get_active_provider()
-        if prov:
-            if prov.default_model and m == prov.default_model.lower():
-                return "openai"
-            if any(m == pm.lower() for pm in prov.models):
-                return "openai"
-    except Exception:
-        pass
 
+    base_m, _ = strip_model_effort(m)
+
+    # 1. Check custom models configured by user per provider
     try:
         from src.models_config import load_models_config
         mcfg = load_models_config()
-        base_m, _ = strip_model_effort(m)
         for prov_name, custom_items in mcfg.custom_models.items():
             if any(m == str(it.get("id", "")).lower() or base_m == str(it.get("id", "")).lower() for it in custom_items):
                 return prov_name
     except Exception:
         pass
 
-    if m.startswith(("gpt-", "codex-", "o1", "o3", "o4")):
-        if "gpt-oss" in m:
+    # 2. Check native Antigravity (AGY) models first so OpenAI-compatible proxy lists
+    #    (which often mirror Gemini/Claude model names) do not hijack native AGY models!
+    try:
+        agy_mids = {mid.lower() for mid, _ in get_available_models(dedup_efforts=True)}
+        if m in agy_mids or base_m in agy_mids:
             return "agy"
+    except Exception:
+        pass
+
+    if "gpt-oss" in m or m.startswith(("gemini-", "claude-")):
+        # Unless it is a legacy Claude 3.x model only available on external APIs
+        if not m.startswith("claude-3"):
+            return "agy"
+
+    # 3. Check native OpenAI Codex CLI models
+    try:
+        codex_mids = {mid.lower() for mid, _ in get_available_codex_models()}
+        if m in codex_mids or base_m in codex_mids:
+            return "codex"
+    except Exception:
+        pass
+
+    if m.startswith(("gpt-6", "gpt-5", "codex-", "o1", "o3", "o4")):
+        return "codex"
+
+    # 4. Check active OpenAI-compatible provider models
+    try:
+        from src.openai_providers import get_active_provider
+        prov = get_active_provider()
+        if prov:
+            if prov.default_model and m == prov.default_model.lower():
+                return "openai"
+            if any(m == pm.lower() or base_m == pm.lower() for pm in prov.models):
+                return "openai"
+    except Exception:
+        pass
+
+    if m.startswith("gpt-"):
         return "codex"
     return "agy"

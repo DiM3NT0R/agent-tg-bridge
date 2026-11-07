@@ -98,24 +98,58 @@ def save_models_config(config: ModelsConfig, storage_path: Path | None = None) -
     tmp_path.replace(path)
 
 
-def is_model_enabled(model_id: str, config: ModelsConfig | None = None, storage_path: Path | None = None) -> bool:
+def is_model_enabled(
+    model_id: str,
+    config: ModelsConfig | None = None,
+    storage_path: Path | None = None,
+    provider: str | None = None,
+) -> bool:
     """Check if model is enabled (not hidden in disabled_models)."""
     cfg = config or load_models_config(storage_path)
     clean_id = model_id.strip().lower()
+    prov = provider.strip().lower() if provider else ""
+    scoped_id = f"{prov}:{clean_id}" if prov else ""
     for d in cfg.disabled_models:
-        if d.lower() == clean_id:
-            return False
+        d_low = d.strip().lower()
+        if prov:
+            if d_low == scoped_id or d_low == clean_id:
+                return False
+        else:
+            if d_low == clean_id:
+                return False
     return True
 
 
 def toggle_model_visibility(
     model_id: str,
     storage_path: Path | None = None,
+    provider: str | None = None,
 ) -> bool:
     """Toggle model visibility in /model picker. Returns True if now enabled, False if disabled."""
     cfg = load_models_config(storage_path)
     clean_id = model_id.strip()
     clean_lower = clean_id.lower()
+    prov = provider.strip().lower() if provider else ""
+    scoped_id = f"{prov}:{clean_id}" if prov else clean_id
+    scoped_lower = scoped_id.lower()
+
+    if prov:
+        currently_enabled = is_model_enabled(clean_id, cfg, provider=prov)
+        if not currently_enabled:
+            # Currently disabled -> Enable it for this provider.
+            # If it was disabled via a bare legacy entry (without provider prefix),
+            # remove the bare entry so this provider is enabled.
+            cfg.disabled_models = [
+                d for d in cfg.disabled_models
+                if d.strip().lower() not in (scoped_lower, clean_lower)
+            ]
+            save_models_config(cfg, storage_path)
+            return True
+        else:
+            # Currently enabled -> Disable it strictly for this provider!
+            cfg.disabled_models.append(scoped_id)
+            save_models_config(cfg, storage_path)
+            return False
 
     found_idx = -1
     for i, d in enumerate(cfg.disabled_models):
@@ -152,6 +186,7 @@ def add_custom_model(
 
     clean_name = display_name.strip() or clean_id
     cfg = load_models_config(storage_path)
+    scoped_lower = f"{prov}:{clean_id.lower()}"
 
     # Ensure list exists
     if prov not in cfg.custom_models:
@@ -162,13 +197,19 @@ def add_custom_model(
         if item["id"].lower() == clean_id.lower():
             item["name"] = clean_name
             # Ensure not disabled
-            cfg.disabled_models = [d for d in cfg.disabled_models if d.lower() != clean_id.lower()]
+            cfg.disabled_models = [
+                d for d in cfg.disabled_models
+                if d.lower() not in (clean_id.lower(), scoped_lower)
+            ]
             save_models_config(cfg, storage_path)
             return True
 
     cfg.custom_models[prov].append({"id": clean_id, "name": clean_name})
     # If it was in disabled list, remove it
-    cfg.disabled_models = [d for d in cfg.disabled_models if d.lower() != clean_id.lower()]
+    cfg.disabled_models = [
+        d for d in cfg.disabled_models
+        if d.lower() not in (clean_id.lower(), scoped_lower)
+    ]
     save_models_config(cfg, storage_path)
     return True
 
@@ -182,6 +223,7 @@ def remove_custom_model(
     prov = provider.strip().lower()
     cfg = load_models_config(storage_path)
     clean_lower = model_id.strip().lower()
+    scoped_lower = f"{prov}:{clean_lower}"
 
     if prov in cfg.custom_models:
         orig_len = len(cfg.custom_models[prov])
@@ -189,7 +231,10 @@ def remove_custom_model(
             it for it in cfg.custom_models[prov] if it["id"].lower() != clean_lower
         ]
         if len(cfg.custom_models[prov]) < orig_len:
-            cfg.disabled_models = [d for d in cfg.disabled_models if d.lower() != clean_lower]
+            cfg.disabled_models = [
+                d for d in cfg.disabled_models
+                if d.lower() not in (clean_lower, scoped_lower)
+            ]
             save_models_config(cfg, storage_path)
             return True
     return False
@@ -218,7 +263,11 @@ def reset_models_config(
             prov_mids = {m[0].lower() for m in get_available_openai_models()}
         else:
             prov_mids = set()
-        cfg.disabled_models = [d for d in cfg.disabled_models if d.lower() not in prov_mids]
+        prefix = f"{prov}:"
+        cfg.disabled_models = [
+            d for d in cfg.disabled_models
+            if not d.lower().startswith(prefix) and d.lower() not in prov_mids
+        ]
     else:
         cfg = ModelsConfig()
     save_models_config(cfg, storage_path)
@@ -272,7 +321,7 @@ def get_all_provider_models(
         if m_lower in seen_ids:
             continue
         seen_ids.add(m_lower)
-        enabled = is_model_enabled(mid, cfg)
+        enabled = is_model_enabled(mid, cfg, provider=prov)
         result.append((mid, mname, enabled, False))
 
     # 2. Custom models for this provider
@@ -284,7 +333,7 @@ def get_all_provider_models(
         if c_lower in seen_ids:
             continue
         seen_ids.add(c_lower)
-        enabled = is_model_enabled(cid, cfg)
+        enabled = is_model_enabled(cid, cfg, provider=prov)
         result.append((cid, cname, enabled, True))
 
     return result

@@ -405,3 +405,81 @@ async def test_provider_wizard_cancel_and_back(tmp_path: Path, monkeypatch: pyte
     m_norm = InboundMessage(6, 10, 1, 6, "Hello world")
     r_norm = await handle_text_command(m_norm, cs, cfg)
     assert r_norm is None
+
+
+@pytest.mark.asyncio
+async def test_run_openai_compat_with_history_and_reasoning_fallback(tmp_path: Path) -> None:
+    """Verify history_messages are included and reasoning-only responses fall back to thoughts."""
+    prov = OpenAIProvider(
+        id="cheapai",
+        name="CheapAI",
+        base_url="https://api.cheapai.io/v1",
+        api_key="sk-test",
+        default_model="gemini-3.8-flash",
+    )
+
+    chunks = [
+        b"data: {\"choices\": [{\"delta\": {\"reasoning_content\": \"Fallback answer from reasoning\"}}]}\n\n",
+        b"data: {\"usage\": {\"prompt_tokens\": 25, \"completion_tokens\": 10, \"completion_tokens_details\": {\"reasoning_tokens\": 10}}}\n\n",
+        b"data: [DONE]\n\n",
+    ]
+
+    async def fake_aiter_lines():
+        for c in chunks:
+            yield c.decode("utf-8")
+
+    mock_stream_response = AsyncMock()
+    mock_stream_response.status_code = 200
+    mock_stream_response.aiter_lines = fake_aiter_lines
+    mock_stream_response.__aenter__ = AsyncMock(return_value=mock_stream_response)
+    mock_stream_response.__aexit__ = AsyncMock(return_value=None)
+
+    captured_payloads = []
+    def fake_stream(method, url, headers=None, json=None):
+        captured_payloads.append(json)
+        return mock_stream_response
+
+    with patch.object(httpx.AsyncClient, "stream", side_effect=fake_stream):
+        result = await run_openai_compat(
+            "What did I say earlier?",
+            chat_dir=str(tmp_path),
+            provider=prov,
+            history_messages=[
+                {"role": "user", "content": "My secret code is 42"},
+                {"role": "assistant", "content": "Got it, 42."},
+            ],
+        )
+        assert result.exit_code == 0
+        # Because content delta was empty, final_text must fall back to reasoning_content!
+        assert result.text == "Fallback answer from reasoning"
+        assert len(captured_payloads) == 1
+        msgs = captured_payloads[0]["messages"]
+        assert msgs[1] == {"role": "user", "content": "My secret code is 42"}
+        assert msgs[2] == {"role": "assistant", "content": "Got it, 42."}
+        assert msgs[3] == {"role": "user", "content": "What did I say earlier?"}
+
+
+def test_chat_history_persistence_and_handoff(tmp_path: Path) -> None:
+    """Verify append_chat_history, load_chat_history, and get_openai_history_messages."""
+    from src.context_compactor import (
+        append_chat_history,
+        load_chat_history,
+        get_openai_history_messages,
+        clear_chat_history,
+    )
+
+    chat_dir = str(tmp_path)
+    append_chat_history(chat_dir, "Привет, запомни число 777", "Хорошо, запомнил 777!\n\n🌐 <i>[CheapAI: in=10, out=5]</i>", engine="agy")
+    entries = load_chat_history(chat_dir)
+    assert len(entries) == 1
+    assert entries[0]["user"] == "Привет, запомни число 777"
+    assert entries[0]["assistant"] == "Хорошо, запомнил 777!"
+
+    oai_msgs = get_openai_history_messages(chat_dir)
+    assert oai_msgs == [
+        {"role": "user", "content": "Привет, запомни число 777"},
+        {"role": "assistant", "content": "Хорошо, запомнил 777!"},
+    ]
+
+    clear_chat_history(chat_dir)
+    assert load_chat_history(chat_dir) == []

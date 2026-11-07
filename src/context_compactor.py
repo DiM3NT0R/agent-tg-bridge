@@ -20,6 +20,147 @@ if TYPE_CHECKING:
 
 LOG = logging.getLogger("antigravity_telegram_bridge")
 
+HISTORY_FILENAME = ".bridge_history.jsonl"
+MAX_HISTORY_ENTRIES = 16
+
+
+def append_chat_history(
+    chat_dir: str,
+    user_prompt: str,
+    assistant_reply: str,
+    engine: str = "agy",
+    model: str = "",
+) -> None:
+    """Append a completed turn to the per-chat JSONL conversation log."""
+    if not chat_dir or not user_prompt.strip():
+        return
+    # Strip any handoff digest prefix from the stored user prompt so it doesn't snowball
+    clean_user = user_prompt.strip()
+    if "[Запрос пользователя]:\n" in clean_user:
+        clean_user = clean_user.split("[Запрос пользователя]:\n", 1)[1].strip()
+    clean_reply = (assistant_reply or "").strip()
+    # Strip trailing token stats footer (e.g. 🌐 [CheapAI: ...] or 📊 [Codex: ...])
+    for footer_marker in ("\n\n🌐 <i>[", "\n\n📊 <i>["):
+        if footer_marker in clean_reply:
+            clean_reply = clean_reply.split(footer_marker, 1)[0].strip()
+    if not clean_reply:
+        return
+
+    path = Path(chat_dir) / HISTORY_FILENAME
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        existing: list[dict] = []
+        if path.exists():
+            for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    existing.append(json.loads(line))
+                except Exception:
+                    continue
+        existing.append({
+            "user": clean_user[:4000],
+            "assistant": clean_reply[:6000],
+            "engine": engine,
+            "model": model,
+        })
+        existing = existing[-MAX_HISTORY_ENTRIES:]
+        content = "\n".join(json.dumps(item, ensure_ascii=False) for item in existing) + "\n"
+        path.write_text(content, encoding="utf-8")
+    except Exception as e:
+        LOG.debug("Failed to append chat history in %s: %s", chat_dir, e)
+
+
+def load_chat_history(chat_dir: str, limit: int = 8) -> list[dict[str, str]]:
+    """Load recent turns from the per-chat JSONL conversation log."""
+    if not chat_dir:
+        return []
+    path = Path(chat_dir) / HISTORY_FILENAME
+    if not path.exists():
+        return []
+    entries: list[dict[str, str]] = []
+    try:
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                if isinstance(obj, dict) and obj.get("user") and obj.get("assistant"):
+                    entries.append(obj)
+            except Exception:
+                continue
+    except Exception:
+        return []
+    return entries[-limit:]
+
+
+def clear_chat_history(chat_dir: str) -> None:
+    """Clear the per-chat JSONL conversation log (e.g. on /reset or /compact)."""
+    if not chat_dir:
+        return
+    path = Path(chat_dir) / HISTORY_FILENAME
+    try:
+        if path.exists():
+            path.unlink()
+    except Exception:
+        pass
+
+
+def get_agy_transcript_recent_turns(conversation_id: str, limit: int = 4) -> list[dict[str, str]]:
+    """Read recent user/assistant turns directly from agy's transcript.jsonl if available."""
+    if not conversation_id:
+        return []
+    transcript_path = Path(os.path.expanduser(
+        f"~/.gemini/antigravity-cli/brain/{conversation_id}/.system_generated/logs/transcript.jsonl"
+    ))
+    if not transcript_path.exists():
+        return []
+    turns: list[dict[str, str]] = []
+    cur_user = ""
+    try:
+        lines = transcript_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        for raw in lines[-120:]:
+            try:
+                step = json.loads(raw)
+            except Exception:
+                continue
+            stype = step.get("type")
+            content = str(step.get("content") or "").strip()
+            if stype == "USER_INPUT" and content:
+                if "<USER_REQUEST>" in content and "</USER_REQUEST>" in content:
+                    content = content.split("<USER_REQUEST>", 1)[1].split("</USER_REQUEST>", 1)[0].strip()
+                if "\n\n[Please respond in Russian" in content:
+                    content = content.split("\n\n[Please respond in Russian", 1)[0].strip()
+                cur_user = content
+            elif stype == "PLANNER_RESPONSE" and content and not step.get("tool_calls"):
+                if cur_user:
+                    turns.append({"user": cur_user[:2000], "assistant": content[:3000]})
+                    cur_user = ""
+    except Exception as e:
+        LOG.debug("Failed to read agy transcript turns: %s", e)
+    return turns[-limit:]
+
+
+def get_openai_history_messages(
+    chat_dir: str,
+    conversation_id: str = "",
+    limit: int = 6,
+) -> list[dict[str, str]]:
+    """Return OpenAI-format [{'role': 'user', ...}, {'role': 'assistant', ...}] history messages."""
+    entries = load_chat_history(chat_dir, limit=limit)
+    if not entries and conversation_id:
+        entries = get_agy_transcript_recent_turns(conversation_id, limit=limit)
+    msgs: list[dict[str, str]] = []
+    for item in entries:
+        u = str(item.get("user") or "").strip()
+        a = str(item.get("assistant") or "").strip()
+        if u and a:
+            msgs.append({"role": "user", "content": u})
+            msgs.append({"role": "assistant", "content": a})
+    return msgs
+
 
 def get_git_changed_files(chat_dir: str) -> list[str]:
     """Return list of modified or untracked files in the workspace, if git repo."""
@@ -125,6 +266,18 @@ def build_handoff_digest(
 
     if prev_summary:
         lines.append(f"• Текущий контекст/задача: {prev_summary}")
+
+    # 1b. Recent conversation turns from local history or transcript
+    recent_turns = load_chat_history(chat_dir, limit=3)
+    if not recent_turns and conversation_id:
+        recent_turns = get_agy_transcript_recent_turns(conversation_id, limit=3)
+    if recent_turns:
+        lines.append("• Недавние сообщения в диалоге:")
+        for rt in recent_turns:
+            u_snip = str(rt.get("user") or "").strip().replace("\n", " ")[:240]
+            a_snip = str(rt.get("assistant") or "").strip().replace("\n", " ")[:360]
+            lines.append(f"  - Пользователь: {u_snip}")
+            lines.append(f"  - Ассистент: {a_snip}")
 
     # 2. Changed files in workspace
     changed_files = get_git_changed_files(chat_dir)

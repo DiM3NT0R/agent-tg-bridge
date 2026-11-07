@@ -178,6 +178,7 @@ async def run_openai_compat(
     provider: OpenAIProvider,
     model: str = "",
     system_prompt: str = "",
+    history_messages: list[dict[str, str]] | None = None,
     timeout: float = 600.0,
     on_thought: Callable[[str], Awaitable[None]] | None = None,
     on_tool: Callable[[str], Awaitable[None]] | None = None,
@@ -197,8 +198,12 @@ async def run_openai_compat(
 
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system_prompt or DEFAULT_SYSTEM_PROMPT},
-        {"role": "user", "content": prompt},
     ]
+    if history_messages:
+        for hm in history_messages:
+            if isinstance(hm, dict) and hm.get("role") in ("user", "assistant") and hm.get("content"):
+                messages.append({"role": hm["role"], "content": str(hm["content"])})
+    messages.append({"role": "user", "content": prompt})
 
     total_in_tokens = 0
     total_out_tokens = 0
@@ -278,7 +283,8 @@ async def run_openai_compat(
                         choices = data.get("choices") or []
                         if not choices:
                             continue
-                        delta = choices[0].get("delta") or {}
+                        choice0 = choices[0]
+                        delta = choice0.get("delta") or choice0.get("message") or {}
 
                         # 1. Reasoning / Thinking delta (DeepSeek R1 / o1 / o3)
                         r_delta = delta.get("reasoning_content") or delta.get("reasoning")
@@ -378,6 +384,9 @@ async def run_openai_compat(
 
         # No tool calls: final response reached!
         final_text = raw_assistant_text
+        if not final_text.strip() and all_thoughts:
+            # Fallback if a reasoning model emitted all text inside reasoning_content / <think>
+            final_text = all_thoughts[-1]
         break
 
     # If usage tokens weren't reported by provider, estimate roughly

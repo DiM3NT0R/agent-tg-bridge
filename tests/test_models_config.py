@@ -160,3 +160,48 @@ def test_get_engine_for_custom_model(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert get_engine_for_model("custom-codex-brain") == "codex"
     assert get_engine_for_model("custom-gemini-experimental") == "agy"
     assert get_engine_for_model("special-api-llm") == "openai"
+
+
+def test_per_provider_model_visibility_isolation(tmp_path: Path) -> None:
+    """Disabling a model in 'openai' must NOT disable the same model ID in 'agy' or 'codex'."""
+    p = tmp_path / "models_config.json"
+
+    # Disable gemini-3.8-flash under 'openai'
+    is_on = toggle_model_visibility("gemini-3.8-flash", storage_path=p, provider="openai")
+    assert is_on is False
+    assert is_model_enabled("gemini-3.8-flash", storage_path=p, provider="openai") is False
+    # Must still be enabled in 'agy'!
+    assert is_model_enabled("gemini-3.8-flash", storage_path=p, provider="agy") is True
+
+    # Re-enable in 'openai'
+    is_on_again = toggle_model_visibility("gemini-3.8-flash", storage_path=p, provider="openai")
+    assert is_on_again is True
+    assert is_model_enabled("gemini-3.8-flash", storage_path=p, provider="openai") is True
+
+
+def test_engine_not_hijacked_by_openai_provider(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Native AGY and Codex models must not be hijacked to 'openai' when an API provider lists same model names."""
+    from src.openai_providers import OpenAIProvider, save_provider
+
+    prov_path = tmp_path / "providers.json"
+    monkeypatch.setattr("src.openai_providers._DEFAULT_STORAGE_PATH", prov_path)
+    save_provider(
+        OpenAIProvider(
+            id="cheapai",
+            name="CheapAI",
+            base_url="https://api.cheapai.io/v1",
+            api_key="sk-test",
+            default_model="gemini-3.8-flash",
+            models=["gemini-3.8-flash", "claude-opus-5-5", "gpt-6.1-sol", "deepseek-r1"],
+        ),
+        make_active=True,
+        storage_path=prov_path,
+    )
+
+    assert get_engine_for_model("gemini-3.8-flash") == "agy"
+    assert get_engine_for_model("claude-opus-5-5") == "agy"
+    assert get_engine_for_model("gpt-6.1-sol") == "codex"
+    assert get_engine_for_model("deepseek-r1") == "openai"
+    assert get_engine_for_model("openai:gemini-3.8-flash") == "openai"
+    assert get_engine_for_model("agy:gemini-3.8-flash") == "agy"
+    assert get_engine_for_model("codex:gpt-6.1-sol") == "codex"
