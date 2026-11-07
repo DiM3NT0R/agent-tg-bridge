@@ -151,62 +151,103 @@ def get_available_models(
     return raw
 
 
-def get_available_codex_models(force_refresh: bool = False) -> list[tuple[str, str]]:
-    """Fetch available Codex models from ~/.codex/models_cache.json or fallback, ensuring modern models are always present."""
+def parse_codex_models_output(raw_json: str) -> list[tuple[str, str]]:
+    """Parse JSON output from `codex debug models` or ~/.codex/models_cache.json into (slug, display_name) pairs.
+
+    Respects model visibility ('list' only) and sorts by official priority.
+    """
+    try:
+        data = json.loads(raw_json)
+        raw_models = data.get("models", [])
+        if not isinstance(raw_models, list):
+            return []
+
+        def _sort_key(m: dict) -> int:
+            p = m.get("priority")
+            return p if isinstance(p, int) else 999
+
+        models_sorted = sorted(raw_models, key=_sort_key)
+        items: list[tuple[str, str]] = []
+        seen: set[str] = set()
+
+        for m in models_sorted:
+            if not isinstance(m, dict):
+                continue
+            slug = str(m.get("slug") or "").strip()
+            if not slug:
+                continue
+
+            # Skip models hidden by Codex catalog
+            visibility = m.get("visibility", "list")
+            if visibility == "hide":
+                continue
+            if slug in ("codex-auto-review", "gpt-reserve"):
+                continue
+
+            slug_lower = slug.lower()
+            if slug_lower in seen:
+                continue
+            seen.add(slug_lower)
+
+            name = str(m.get("display_name") or slug).strip()
+            items.append((slug, name))
+
+        return items
+    except Exception as exc:
+        LOG.warning("Failed to parse codex models JSON: %s", exc)
+        return []
+
+
+def get_available_codex_models(
+    codex_path: str = "/usr/local/bin/codex",
+    force_refresh: bool = False,
+) -> list[tuple[str, str]]:
+    """Fetch live available models directly from Codex CLI (`codex debug models`),
+    falling back to ~/.codex/models_cache.json or static fallback if CLI is not yet installed.
+    """
     global _cached_codex_models, _cached_codex_at
     now = time.time()
     if not force_refresh and _cached_codex_models is not None and (now - _cached_codex_at) < _CACHE_TTL_S:
         return _cached_codex_models
 
-    items: list[tuple[str, str]] = []
-    seen: set[str] = set()
+    # 1. Primary source: query live Codex CLI directly
+    try:
+        from src.codex_runner import find_codex_bin
+        bin_path = find_codex_bin(codex_path)
+        if bin_path:
+            res = subprocess.run(
+                [bin_path, "debug", "models"],
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+                check=False,
+            )
+            if res.returncode == 0 and res.stdout:
+                parsed = parse_codex_models_output(res.stdout)
+                if parsed:
+                    _cached_codex_models = parsed
+                    _cached_codex_at = now
+                    return parsed
+    except Exception as exc:
+        LOG.debug("Direct `codex debug models` execution failed: %s", exc)
+
+    # 2. Secondary source: read cached models file if CLI didn't run
     cache_file = os.path.expanduser("~/.codex/models_cache.json")
-
-    # Obsolete / deprecated model prefixes to filter out by default
-    deprecated_prefixes = ("gpt-5.4", "gpt-5.5")
-
     if os.path.exists(cache_file):
         try:
             with open(cache_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            for m in data.get("models", []):
-                slug = m.get("slug")
-                if not slug:
-                    continue
-                # Skip internal / hidden / review models
-                if slug in ("codex-auto-review", "gpt-reserve") or m.get("visibility") == "hide":
-                    continue
-                # Skip legacy obsolete models
-                if any(slug.lower().startswith(p) for p in deprecated_prefixes):
-                    continue
-                name = m.get("display_name") or slug
-                slug_lower = slug.lower()
-                if slug_lower not in seen:
-                    seen.add(slug_lower)
-                    items.append((slug, name))
-        except Exception as e:
-            LOG.warning("Failed to parse ~/.codex/models_cache.json: %s", e)
+                parsed = parse_codex_models_output(f.read())
+            if parsed:
+                _cached_codex_models = parsed
+                _cached_codex_at = now
+                return parsed
+        except Exception as exc:
+            LOG.warning("Failed to read ~/.codex/models_cache.json: %s", exc)
 
-    # Ensure modern flagship GPT-6 models are always present even if cache is stale or missing them
-    for fallback_id, fallback_name in FALLBACK_CODEX_MODELS:
-        if fallback_id.lower() not in seen:
-            items.append((fallback_id, fallback_name))
-            seen.add(fallback_id.lower())
-
-    # Sort/prioritize: ensure modern flagship GPT-6 models are at the top
-    priority_order = ["gpt-6.1-sol", "gpt-6-astra", "gpt-6.1-terra", "gpt-6-sol", "gpt-6-luna"]
-    ordered: list[tuple[str, str]] = []
-    for pid in priority_order:
-        match = next((item for item in items if item[0].lower() == pid), None)
-        if match:
-            ordered.append(match)
-    for item in items:
-        if item[0].lower() not in priority_order:
-            ordered.append(item)
-
-    _cached_codex_models = ordered
-    _cached_codex_at = now
-    return ordered
+    # 3. Fallback if codex is not installed and cache is missing
+    if _cached_codex_models:
+        return _cached_codex_models
+    return list(FALLBACK_CODEX_MODELS)
 
 
 def get_available_openai_models() -> list[tuple[str, str]]:

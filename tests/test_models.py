@@ -94,33 +94,42 @@ def test_extract_model_and_effort() -> None:
     assert extract_model_and_effort("gpt-6.1-sol", "medium") == ("gpt-6.1-sol", "medium")
 
 
-def test_get_available_codex_models_filters_deprecated_and_ensures_gpt6(tmp_path: Path, monkeypatch) -> None:
+def test_parse_codex_models_output() -> None:
+    from src.models import parse_codex_models_output
+    raw = json.dumps({
+        "models": [
+            {"slug": "gpt-5.4", "display_name": "GPT-5.4", "visibility": "hide", "priority": 99},
+            {"slug": "gpt-6.1-sol", "display_name": "GPT-6.1-Sol", "visibility": "list", "priority": 1},
+            {"slug": "gpt-6-astra", "display_name": "GPT-6-Astra", "visibility": "list", "priority": 2},
+            {"slug": "codex-auto-review", "display_name": "Auto Review", "visibility": "hide", "priority": 10},
+        ]
+    })
+    parsed = parse_codex_models_output(raw)
+    assert parsed == [
+        ("gpt-6.1-sol", "GPT-6.1-Sol"),
+        ("gpt-6-astra", "GPT-6-Astra"),
+    ]
+
+
+def test_get_available_codex_models_live_cli(monkeypatch) -> None:
     from src.models import get_available_codex_models
 
-    fake_cache = tmp_path / "models_cache.json"
-    fake_cache.write_text(json.dumps({
+    fake_json = json.dumps({
         "models": [
-            {"slug": "gpt-5.4", "display_name": "GPT-5.4", "visibility": "list"},
-            {"slug": "gpt-5.4-mini", "display_name": "GPT-5.4-Mini", "visibility": "list"},
-            {"slug": "gpt-5.5", "display_name": "GPT-5.5", "visibility": "list"},
-            {"slug": "gpt-5.6-sol", "display_name": "GPT-5.6-Sol", "visibility": "list"},
-            {"slug": "gpt-reserve", "display_name": "GPT-Reserve", "visibility": "hide"},
-            {"slug": "codex-auto-review", "display_name": "Codex Auto Review", "visibility": "hide"},
+            {"slug": "gpt-6.1-sol", "display_name": "GPT-6.1-Sol", "visibility": "list", "priority": 1},
+            {"slug": "gpt-6-astra", "display_name": "GPT-6-Astra", "visibility": "list", "priority": 2},
+            {"slug": "gpt-reserve", "display_name": "Reserve", "visibility": "hide", "priority": 5},
         ]
-    }))
-    monkeypatch.setattr("os.path.expanduser", lambda p: str(fake_cache) if "models_cache.json" in p else p)
+    })
+
+    fake_res = MagicMock()
+    fake_res.returncode = 0
+    fake_res.stdout = fake_json
+    monkeypatch.setattr("subprocess.run", lambda *args, **kwargs: fake_res)
+    monkeypatch.setattr("src.codex_runner.find_codex_bin", lambda *_: "/usr/local/bin/codex")
 
     models = get_available_codex_models(force_refresh=True)
-    slugs = [slug for slug, _ in models]
-
-    # Stale 5.4 / 5.5 and hidden models must be filtered out
-    assert "gpt-5.4" not in slugs
-    assert "gpt-5.4-mini" not in slugs
-    assert "gpt-5.5" not in slugs
-    assert "gpt-reserve" not in slugs
-    assert "codex-auto-review" not in slugs
-
-    # Modern flagship models must be injected at the top
-    assert slugs[0] == "gpt-6.1-sol"
-    assert "gpt-6-astra" in slugs
-    assert "gpt-6.1-terra" in slugs
+    assert models == [
+        ("gpt-6.1-sol", "GPT-6.1-Sol"),
+        ("gpt-6-astra", "GPT-6-Astra"),
+    ]
